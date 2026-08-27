@@ -1,0 +1,15 @@
+node_modules/
+dist/
+release/
+*.exe
+*.blockmap
+*.nupkg
+*.AppImage
+*.snap
+*.dmg
+.DS_Store
+Thumbs.db
+*.log
+out/
+.env
+.env.*
