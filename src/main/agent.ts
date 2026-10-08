@@ -24,6 +24,7 @@ import { composeTaskReport, composeTaskReportParts, emptyTaskSummary, htmlLocalR
 import { chatBoundaryNotice, detectWorkspaceClaims, normalizeChatResponse } from "./chatResponse.js";
 import { planIntentForRequest } from "../shared/taskActivity.js";
 import { imageGenerationCapability, preferredImageModelPattern, resolveThinkingEnabled } from "../shared/modelCapabilities.js";
+import { imageGenerationIntent } from "../shared/imageRouting.js";
 import { currentTurnHasImage, imagesOf, toProviderMessage, type ProviderMessage } from "../shared/vision.js";
 
 /** Text files whose final contents are analysed for features/controls. */
@@ -39,11 +40,14 @@ const MAX_ANALYSIS_CHARS = 400_000;
  * (b) tell the user honestly when no image output is possible. A false positive
  * is harmless (the model just answers in text); a false negative leaves normal
  * text behaviour completely untouched.
+ *
+ * The predicate itself lives in `shared/imageRouting.ts`, next to the endpoint
+ * rule it feeds, so intent detection and routing can never disagree — and so
+ * the same predicates are what the routing tests exercise. Understanding a
+ * picture ("what is this image?") is deliberately NOT an image request.
  */
-const IMAGE_INTENT = /\b(?:generate|create|make|draw|design|render|produce)\b[^.!?]{0,60}\b(?:image|picture|photo|illustration|logo|artwork|poster|thumbnail|icon)\b|\b(?:edit|modify|change|alter|retouch)\b[^.!?]{0,60}\b(?:image|picture|photo)\b|\b(?:image|picture)\s+generation\b/i;
-
 export function looksLikeImageRequest(text: string): boolean {
-  return IMAGE_INTENT.test((text ?? "").trim());
+  return imageGenerationIntent(text);
 }
 
 /** File extension for a generated image MIME type. */
@@ -1223,6 +1227,10 @@ export class Agent {
           // THIS model. Models without a reasoning channel never receive the
           // control parameter — unsupported reasoning is never requested.
           thinking: resolveThinkingEnabled(settings.thinkingPreferences, providerOfModel(modelName), modelName),
+          // Intent of THIS turn. Routing to an image model is not enough: a
+          // gateway that serves chat and images on separate endpoints must be
+          // told which one this is, or it rejects the request outright.
+          intent: imageTurn ? "image_generation" : "chat",
           signal: combinedSignal
         })) {
           guard.noteActivity(); // streaming data → keep the request alive
@@ -1519,6 +1527,9 @@ export class Agent {
               temperature: 0.3,
               maxOutputTokens: settings.maxOutputTokens,
               thinking: resolveThinkingEnabled(settings.thinkingPreferences, providerOfModel(modelName), modelName),
+              // Same intent as the turn it retries: a retry must never silently
+              // move an image turn onto the chat endpoint.
+              intent: imageTurn ? "image_generation" : "chat",
               signal: AbortSignal.any([retryAbort.signal, guard.signal])
             })) {
               if (this.stopped || retryAbort.signal.aborted) break;
@@ -2423,6 +2434,7 @@ export class Agent {
         temperature: settings.temperature,
         maxOutputTokens: settings.maxOutputTokens,
         thinking: resolveThinkingEnabled(settings.thinkingPreferences, providerOfModel(settings.selectedModel), settings.selectedModel),
+        intent: looksLikeImageRequest(lastUserText) ? "image_generation" : "chat",
         signal: chatCallSignal
       })) {
         guard.noteActivity(); // streaming data → keep the request alive
@@ -2722,6 +2734,8 @@ export class Agent {
         temperature: settings.temperature,
         maxOutputTokens: settings.maxOutputTokens,
         thinking: resolveThinkingEnabled(settings.thinkingPreferences, providerOfModel(settings.selectedModel), settings.selectedModel),
+        // An explicit image-generation turn — never the chat endpoint.
+        intent: "image_generation",
         signal
       })) {
         guard.noteActivity();

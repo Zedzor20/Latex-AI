@@ -1,20 +1,84 @@
+# Dependencies
 node_modules/
+**/node_modules/
+
+# Build output
 dist/
-release/
-.tmp-stream-filter/
-.tmp-change-summary/
-.tmp-acceptance/
-.tmp-liveness/
-*.exe
-*.blockmap
-*.nupkg
-*.AppImage
-*.snap
-*.dmg
-.DS_Store
-Thumbs.db
-*.log
+build/
 out/
+release/
+releases/
+*.asar
+*.asar.unpacked/
+
+# Electron / packaging
+electron-builder.yml
+*.blockmap
+latest.yml
+app-update.yml
+
+# Environment / secrets
 .env
 .env.*
-.tmp-final/
+!.env.example
+
+# API keys / credentials
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+service-account.json
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+tmp/
+temp/
+.cache/
+*.tmp
+
+# Coverage / tests
+coverage/
+.nyc_output/
+
+# Local application data
+data/
+userdata/
+user-data/
+local-data/
+
+# Electron local/runtime files
+crashDumps/
+GPUCache/
+Code Cache/
+DawnCache/
+Service Worker/CacheStorage/
+
+# Generated screenshots/videos
+screenshots/
+*.mp4
+*.mov
+*.webm
+
+# Local backups
+*.bak
+*.backup

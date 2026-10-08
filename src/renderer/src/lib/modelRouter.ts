@@ -92,7 +92,15 @@ function familyScore(model: GeminiModel, task: TaskKind): number {
  */
 export function pickModel(models: GeminiModel[], task: TaskKind, exclude?: Set<string>): ModelChoice {
   if (models.length === 0) return { model: undefined, reason: TASK_REASONS[task], task };
-  const ranked = [...models].sort((a, b) => familyScore(b, task) - familyScore(a, task));
+  // A model the provider says cannot hold a text conversation (an
+  // image-generation-only route, for example) must never be chosen to answer a
+  // request: it would fail at the API instead of answering. Only an EXPLICIT
+  // `false` disqualifies a model — unknown (`undefined`) never does, so a
+  // catalog with thin metadata keeps every model it has. The fallback keeps a
+  // mislabelled catalog from leaving Auto with nothing to pick.
+  const chatCapable = models.filter((model) => model.supportsChat !== false);
+  const candidates = chatCapable.length > 0 ? chatCapable : models;
+  const ranked = [...candidates].sort((a, b) => familyScore(b, task) - familyScore(a, task));
   // Skip models that already failed this request
   if (exclude && exclude.size > 0) {
     for (const m of ranked) {

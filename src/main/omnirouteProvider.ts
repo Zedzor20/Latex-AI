@@ -417,25 +417,27 @@ function booleanFlag(value: unknown): boolean | undefined {
  * Diffusion and any future image model all flow through the same rule.
  */
 function readModelFacts(id: string, entry: Record<string, unknown>): OmniRouteModelFacts {
-  const declared = [
-    ...stringList(entry.capabilities),
-    ...stringList(entry.capability),
-    ...stringList(entry.capability_tags),
-    ...stringList(entry.tags),
-    ...stringList(entry.features),
-    ...stringList(entry.type),
-    ...stringList(entry.model_type),
-    ...stringList(entry.category),
-    ...stringList(entry.task),
-    ...stringList(entry.kind),
-    ...stringList(entry.modalities),
-    ...stringList(entry.output_modalities),
-    ...stringList(entry.outputs),
-    // `modalities` may be an object (`{ input: ["text"], output: ["image"] }`)
-    // rather than a flat list — read both sides when that is the shape.
-    ...stringList((entry.modalities as { input?: unknown } | undefined)?.input),
-    ...stringList((entry.modalities as { output?: unknown } | undefined)?.output)
-  ].map((token) => token.toLowerCase());
+  // Tokens are grouped by WHAT THEY DESCRIBE, because the distinction is the
+  // whole point: `image` among a model's INPUT modalities is vision (it receives
+  // pictures), while `image` among its OUTPUT modalities is image generation (it
+  // produces them). Flattening the two together would make every vision model
+  // look like an image generator.
+  const modalities = entry.modalities as { input?: unknown; output?: unknown } | undefined;
+  const lower = (values: unknown[]): string[] =>
+    values.flatMap((value) => stringList(value)).map((token) => token.toLowerCase());
+  /** Declared capability/tag/feature tokens. */
+  const capabilityTokens = lower([
+    entry.capabilities, entry.capability, entry.capability_tags, entry.tags, entry.features
+  ]);
+  /** Declared model kind (type/category/task). */
+  const typeTokens = lower([entry.type, entry.model_type, entry.category, entry.task, entry.kind]);
+  /** What the model PRODUCES. */
+  const outputTokens = lower([entry.output_modalities, entry.outputs, modalities?.output]);
+  /** What the model ACCEPTS. */
+  const inputTokens = lower([entry.input_modalities, modalities?.input]);
+  // Flat view for the shared capability layer (its explicit checks match exact
+  // capability names, so an input `image` token cannot claim generation there).
+  const declared = [...capabilityTokens, ...typeTokens, ...outputTokens, ...inputTokens];
 
   // Endpoint declarations name what the model can be asked for.
   const endpointTokens = stringList(entry.endpoints)
@@ -452,37 +454,48 @@ function readModelFacts(id: string, entry: Record<string, unknown>): OmniRouteMo
     booleanFlag(entry.supportsChat) ??
     booleanFlag(entry.chat);
 
+  const IMAGE_TOKEN = /^(image|images|image[-_]?generation|image[-_]?output|image[-_]?gen|text[-_]?to[-_]?image|txt2img|t2i)$/;
+  const CHAT_TOKEN = /^(chat|completion|completions|text|text[-_]?generation|llm|conversational)$/;
+  // Image production is claimed by an explicit flag, a capability/type token,
+  // an OUTPUT modality, or an endpoint declaration — never by an input modality.
   const declaresImage =
     flagImage === true ||
-    declared.some((t) => /^(image[-_]?generation|image[-_]?output|image[-_]?gen|text[-_]?to[-_]?image|txt2img|t2i|images)$/.test(t)) ||
+    capabilityTokens.some((t) => IMAGE_TOKEN.test(t)) ||
+    typeTokens.some((t) => IMAGE_TOKEN.test(t)) ||
+    outputTokens.some((t) => IMAGE_TOKEN.test(t)) ||
     endpointTokens.some((t) => /images?\/(generations|generate)|images_generations/.test(t));
   const declaresChat =
     flagChat === true ||
-    declared.some((t) => /^(chat|completion|completions|text|text[-_]?generation|llm|conversational)$/.test(t)) ||
+    capabilityTokens.some((t) => CHAT_TOKEN.test(t)) ||
+    typeTokens.some((t) => CHAT_TOKEN.test(t)) ||
+    outputTokens.some((t) => CHAT_TOKEN.test(t)) ||
     endpointTokens.some((t) => /chat\/completions|chat_completions|\/completions$/.test(t));
 
+  // Vision is about ACCEPTING pictures: only flags, capability/type tokens and
+  // INPUT modalities can claim it.
+  const VISION_TOKEN = /^(vision|image|images|image[-_]?understanding|image[-_]?input|multimodal|visual)$/;
   const supportsVision =
     booleanFlag(entry.supports_vision) === true ||
     booleanFlag(entry.supportsVision) === true ||
-    declared.some((t) => /^(vision|image[-_]?understanding|image[-_]?input|multimodal|visual)$/.test(t)) ||
-    stringList(entry.input_modalities).some((t) => /image/.test(t.toLowerCase()));
+    capabilityTokens.some((t) => VISION_TOKEN.test(t)) ||
+    typeTokens.some((t) => VISION_TOKEN.test(t)) ||
+    inputTokens.some((t) => VISION_TOKEN.test(t));
 
   // "Image only" needs POSITIVE evidence: the model is declared to produce
-  // images (or output only images) and nothing anywhere declares chat.
-  const outputsText = declared.some((t) => /^(text|chat|completion|completions)$/.test(t));
-  const outputsImage = declared.some((t) => /^(image|images)$/.test(t));
-  const declaresImageEndpoint = endpointTokens.some((t) => /images?\/(generations|generate)|images_generations/.test(t));
-  const declaresChatEndpoint = endpointTokens.some((t) => /chat\/completions|chat_completions/.test(t));
+  // images and NOTHING anywhere declares chat. An explicit `supports_chat:
+  // false` is positive evidence too.
+  const outputsText = outputTokens.some((t) => /^(text|chat|completion|completions)$/.test(t));
   const declaredImageOnly =
     flagChat === false ||
-    (declaresImage && !declaresChat && !outputsText) ||
-    (declaresImageEndpoint && !declaresChatEndpoint && !declaresChat && !outputsText) ||
-    (outputsImage && !outputsText && declared.some((t) => /image[-_]?generation/.test(t)));
+    (declaresImage && !declaresChat && !outputsText);
 
   const supportsChat =
-    flagChat !== undefined ? flagChat
-      : declaredChat || outputsText ? true
-        : declaredImageOnly ? false
+    flagChat !== undefined
+      ? flagChat
+      : declaresChat || outputsText
+        ? true
+        : declaredImageOnly
+          ? false
           : undefined;
 
   return {
@@ -701,6 +714,10 @@ function isImageModelOnChatEndpointError(message: string): boolean {
   ) || /cannot be used on \/?v1\/chat\/completions/i.test(message);
 }
 
+/** Language a backend uses when it will not accept one of our body fields. */
+const UNSUPPORTED_FIELD =
+  /unsupported|not supported|does not (support|allow|accept)|unknown (parameter|field|argument)|unrecognized|unexpected|extra (field|parameter)|invalid (parameter|field|argument)/i;
+
 /**
  * A clear, actionable message for an image-generation model asked to chat.
  * Says what the model cannot do and what the user should do instead.
@@ -742,6 +759,25 @@ export class OmniRouteProvider implements AIProvider {
   }
 
   async *generate(input: GeminiGenerateInput): AsyncGenerator<GeminiChunk> {
+    const modelId = input.model.replace(/^omniroute\//, "");
+    // ── ENDPOINT DECISION — before any request is constructed ─────────
+    // Intent (what the user asked for) plus capability (what this model really
+    // is) decide the endpoint. An image-generation model posted to
+    // /v1/chat/completions is rejected by OmniRoute outright, so that request
+    // is never built: either it goes to /v1/images/generations, or the user is
+    // told plainly why this model cannot serve the request.
+    const intent: RequestIntent = input.intent ?? "chat";
+    const decision = resolveProviderEndpoint(intent, routeableCapabilitiesFor(modelId));
+    if (!decision.ok) {
+      throw classifyHttpStatus("omniroute", modelId, 400, decision.reason);
+    }
+    if (decision.endpoint === "/v1/images/generations") {
+      // A different endpoint AND a different response format — its own adapter,
+      // never the chat SSE parser.
+      yield* this.generateImage(input, modelId);
+      return;
+    }
+
     const normalized = normalizeBaseUrl(this.baseUrl);
     const url = /\/v1$/.test(normalized) ? `${normalized}/chat/completions` : `${normalized}/v1/chat/completions`;
     const messages = input.messages.map((message) => ({
@@ -839,8 +875,6 @@ export class OmniRouteProvider implements AIProvider {
       headers["Authorization"] = `Bearer ${this.apiKey}`;
     }
 
-    const modelId = input.model.replace(/^omniroute\//, "");
-
     let res: Response;
     try {
       res = await fetch(url, {
@@ -859,6 +893,13 @@ export class OmniRouteProvider implements AIProvider {
 
     if (!res.ok) {
       const message = await this.errorDetail(res);
+      // The gateway's way of saying "this model can only make images". Name what
+      // the model is and what the user should do instead of echoing an internal
+      // endpoint error. `fallbackAllowed` stays true, so Auto can move to a
+      // model that really can hold the conversation.
+      if (isImageModelOnChatEndpointError(message)) {
+        throw classifyHttpStatus("omniroute", modelId, 400, IMAGE_ONLY_CHAT_MESSAGE);
+      }
       throw classifyHttpStatus("omniroute", modelId, res.status, message);
     }
 
@@ -979,6 +1020,90 @@ export class OmniRouteProvider implements AIProvider {
       throw this.classifyError(modelId, netErr);
     } finally {
       await reader.cancel().catch(() => undefined);
+    }
+  }
+
+  /**
+   * IMAGE-GENERATION REQUEST — `POST /v1/images/generations`.
+   *
+   * The request is built from the image endpoint's own contract, NOT from the
+   * chat body: `messages`, `tools`, `tool_choice`, `reasoning`, `temperature`
+   * and `stream` are meaningless here and are never sent. Latex sends only what
+   * the endpoint defines, and falls back to a smaller body — one field at a
+   * time — when a backend says it does not accept a field, rather than
+   * assuming which backends accept what.
+   *
+   * The response is NOT an SSE chat stream, so it is normalized by its own
+   * adapter into real images and yielded on the existing image channel; nothing
+   * here can be mistaken for assistant text or reasoning.
+   */
+  private async *generateImage(input: GeminiGenerateInput, modelId: string): AsyncGenerator<GeminiChunk> {
+    const url = imagesUrl(this.baseUrl);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    // Same authentication as every other OmniRoute call — one key, one store.
+    if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
+
+    const prompt = imagePromptFrom(input);
+    if (!prompt) {
+      throw classifyHttpStatus("omniroute", modelId, 400, "An image request needs a prompt describing the image to generate.");
+    }
+
+    // Richest accepted body first; each retry drops ONE optional field, and only
+    // after the gateway said that field is the problem.
+    const attemptBodies: Array<Record<string, unknown>> = [
+      { model: modelId, prompt, n: 1, response_format: "b64_json" },
+      { model: modelId, prompt, n: 1 },
+      { model: modelId, prompt }
+    ];
+
+    let ok: Response | null = null;
+    let lastMessage = "";
+    for (const body of attemptBodies) {
+      const res = await this.postImage(url, headers, body, input.signal, modelId);
+      if (res.ok) { ok = res; break; }
+      lastMessage = await this.errorDetail(res);
+      const retryableField = (res.status === 400 || res.status === 422) && UNSUPPORTED_FIELD.test(lastMessage);
+      if (!retryableField) throw classifyHttpStatus("omniroute", modelId, res.status, lastMessage);
+    }
+    if (!ok) {
+      throw classifyHttpStatus("omniroute", modelId, 400, lastMessage || "OmniRoute rejected the image request.");
+    }
+
+    let payload: unknown;
+    try {
+      payload = await ok.json();
+    } catch {
+      throw classifyHttpStatus("omniroute", modelId, 502, "OmniRoute returned an unreadable image response.");
+    }
+    // HTTP 200 with an `error` body still means no picture was produced.
+    const bodyError = safeExtractMessage((payload as { error?: unknown } | undefined)?.error);
+    if (bodyError) throw classifyHttpStatus("omniroute", modelId, 400, bodyError);
+
+    const images = await extractGeneratedImages(payload);
+    if (images.length === 0) {
+      throw classifyHttpStatus("omniroute", modelId, 502, "OmniRoute returned no image data for this request.");
+    }
+    for (const image of images) {
+      yield { type: "image", mimeType: image.mimeType, data: image.data };
+    }
+  }
+
+  /** POST to the image endpoint, with abort/network errors classified. */
+  private async postImage(
+    url: string,
+    headers: Record<string, string>,
+    body: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    modelId: string
+  ): Promise<Response> {
+    try {
+      return await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+    } catch (err) {
+      if (err instanceof Error && (err.name === "AbortError" || /abort/i.test(err.message))) {
+        throw classifyHttpStatus("omniroute", modelId, 0, "Request aborted.");
+      }
+      const netMsg = err instanceof Error ? err.message : typeof err === "string" ? err : safeExtractMessage(err) || "Network error";
+      throw classifyNetworkError("omniroute", modelId, new Error(netMsg));
     }
   }
 

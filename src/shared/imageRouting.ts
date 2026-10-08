@@ -70,7 +70,7 @@ export interface RouteDecision {
  * which is what keeps "what is this image?" out of this path.
  */
 export const IMAGE_GENERATION_INTENT_PATTERN =
-  /\b(?:generate|create|make|draw|design|render|produce|paint|sketch|illustrate|give me)\b[^.!?]{0,60}\b(?:image|picture|photo|illustration|logo|artwork|poster|thumbnail|icon|avatar|wallpaper|sprite|render)\b|\b(?:image|picture|photo|illustration|logo|artwork|poster|thumbnail|avatar)\s+(?:generation|creation)\b|\b(?:text|txt)\s*2\s*(?:image|img)\b|\bgenerate\s+(?:this|it|that)\s+as\s+an\s+image\b/i;
+  /\b(?:generate|create|make|draw|design|render|produce|paint|sketch|illustrate|give me)\b[^.!?]{0,60}\b(?:image|picture|photo|illustration|logo|artwork|poster|thumbnail|icon|avatar|wallpaper|sprite|render)\b|\b(?:edit|modify|change|alter|retouch)\b[^.!?]{0,60}\b(?:image|picture|photo)\b|\b(?:image|picture|photo|illustration|logo|artwork|poster|thumbnail|avatar)\s+(?:generation|creation)\b|\b(?:text|txt)\s*2\s*(?:image|img)\b|\bgenerate\s+(?:this|it|that)\s+as\s+an\s+image\b/i;
 
 /**
  * A request to UNDERSTAND an existing image. These are vision turns: the model
@@ -80,7 +80,7 @@ export const IMAGE_GENERATION_INTENT_PATTERN =
  * and noun, so this guard is what keeps it a vision turn.
  */
 export const IMAGE_UNDERSTANDING_INTENT_PATTERN =
-  /\b(?:what|which|who|where|when|why|how)\b[^.!?]{0,40}\b(?:image|picture|photo|screenshot|this)\b|\b(?:describe|explain|analy[sz]e|read|interpret|identify|recognize|recognise|extract|transcribe|summari[sz]e|review|critique|compare)\b[^.!?]{0,40}\b(?:image|picture|photo|screenshot|diagram|chart|logo|attachment)\b|\b(?:image|picture|photo|screenshot)\s+(?:understanding|analysis|description|recognition)\b|\bwhat(?:'s| is)\s+(?:in|on)\s+(?:this|the|that)\s+(?:image|picture|photo|screenshot)\b/i;
+  /\b(?:what|which|who|where|when|why|how)\b[^.!?]{0,40}\b(?:image|picture|photo|screenshot|this)\b|\b(?:describ\w*|explanation|explain|analy[sz]\w*|read|interpret\w*|identif\w*|recogni[sz]\w*|extract|transcri\w*|summari[sz]\w*|caption\w*|review|critique|compare)\b[^.!?]{0,40}\b(?:image|picture|photo|screenshot|diagram|chart|logo|attachment)\b|\b(?:image|picture|photo|screenshot)\s+(?:understanding|analysis|description|recognition|captioning)\b|\bwhat(?:'s| is)\s+(?:in|on)\s+(?:this|the|that)\s+(?:image|picture|photo|screenshot)\b/i;
 
 /**
  * True only for an explicit image-GENERATION request.
