@@ -21,16 +21,36 @@ export interface TextToolCall {
 const KNOWN_TOOLS = new Set([
   "read_file", "write_file", "create_file", "edit_file", "delete_file",
   "rename_file", "move_file", "list_directory", "search_files",
-  "create_directory", "get_workspace_info", "run_command", "list_files"
+  "search_project", "create_directory", "delete_directory",
+  "get_workspace_info", "run_command", "list_files",
+  "file_exists", "get_file_info", "copy_file",
+  "open_file", "open_folder", "open_application", "open_url",
+  "take_screenshot", "mouse_move", "mouse_click",
+  "keyboard_type", "keyboard_press"
 ]);
 
 const TOOL_NAME_LIST = [
   "read_file", "write_file", "create_file", "edit_file", "delete_file",
   "rename_file", "move_file", "list_directory", "search_files",
-  "create_directory", "get_workspace_info", "run_command", "list_files"
+  "search_project", "create_directory", "delete_directory",
+  "get_workspace_info", "run_command", "list_files",
+  "file_exists", "get_file_info", "copy_file"
 ];
 
 const TOOL_NAME_PATTERN = TOOL_NAME_LIST.join("|");
+
+/** True when a name is one of Latex's tool names (case-insensitive). */
+export function isKnownToolName(name: string): boolean {
+  return KNOWN_TOOLS.has(String(name ?? "").trim().toLowerCase());
+}
+
+/** True while a partial value could still grow into a real tool name. */
+export function isToolNamePrefix(partial: string): boolean {
+  const p = String(partial ?? "").trim().toLowerCase();
+  if (!p) return true;
+  for (const t of KNOWN_TOOLS) if (t.startsWith(p)) return true;
+  return false;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -46,7 +66,10 @@ function isToolCallLike(obj: unknown): boolean {
 function hasToolName(text: string): boolean {
   if (!text) return false;
   for (const name of TOOL_NAME_LIST) {
-    if (text.includes(`"${name}"`) || text.includes(`\\"${name}\\"`)) return true;
+    // Match tool name in JSON-like context: {"name": "tool_name", ...}
+    // but NOT in natural language like: I'll use read_file to...
+    if (text.includes(`"name"`) && text.includes(`"${name}"`)) return true;
+    if (text.includes(`\\"name\\"`) && text.includes(`\\"${name}\\"`)) return true;
   }
   return false;
 }
@@ -201,8 +224,25 @@ export function parseTextToolCalls(text: string): TextToolCall[] {
  * clean prose only. Uses a multi-pass approach to catch every variant.
  */
 export function stripToolCallBlocks(text: string): string {
+  const out = stripProtocolArtifacts(text, false);
+  const stripped = out.replace(/[\s\n\r]/g, "");
+  if (stripped.length < 2) return "";
+  return out;
+}
+
+/**
+ * Artifact removal without the trailing trim. Used on streaming fragments,
+ * where trimming each piece would glue "Hello " + "world" into "Helloworld".
+ */
+export function stripProtocolArtifacts(text: string, trim = true): string {
   if (!text) return "";
   let out = text;
+
+  // Pass 0: Internal reasoning markers never belong to the answer channel.
+  // Remove whole <thought>..</thought> blocks first, then orphaned markers.
+  out = out.replace(/<thought[\s\S]*?<\/thought\s*>/gi, "");
+  out = out.replace(/<\/?thought(?:\s[^>]*)?>/gi, "");
+  out = out.replace(/^[^\S\n]*\/?thought>[^\S\n]*$/gim, "");
 
   // Pass 1: Remove properly-tagged blocks
   out = out.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "");
@@ -252,11 +292,7 @@ export function stripToolCallBlocks(text: string): string {
   // Pass 9: Clean up empty JSON artifacts and excessive whitespace
   out = out.replace(/\{\s*\}/g, "");
   out = out.replace(/\[\s*\]/g, "");
-  out = out.replace(/\n{3,}/g, "\n\n").trim();
-
-  // Final check: if nothing meaningful remains, return empty
-  const stripped = out.replace(/[\s\n\r]/g, "");
-  if (stripped.length < 2) return "";
+  if (trim) out = out.replace(/\n{3,}/g, "\n\n").trim();
 
   return out;
 }
@@ -270,7 +306,8 @@ export function containsToolCall(text: string): boolean {
   if (/<function_call/.test(text)) return true;
   if (/"type"\s*:\s*"tool_call"/.test(text)) return true;
   if (/function_calls?\s*\[/.test(text)) return true;
-  if (/```[\s\S]*"name"[\s\S]*```/.test(text)) return true;
+  // Only match fenced JSON that looks like a tool call object
+  if (/```[\s\S]*?"name"\s*:\s*"[^"]+"[\s\S]*?```/.test(text)) return true;
   return hasToolName(text);
 }
 

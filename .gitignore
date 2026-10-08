@@ -1,6 +1,10 @@
 node_modules/
 dist/
 release/
+.tmp-stream-filter/
+.tmp-change-summary/
+.tmp-acceptance/
+.tmp-liveness/
 *.exe
 *.blockmap
 *.nupkg
@@ -13,3 +17,4 @@ Thumbs.db
 out/
 .env
 .env.*
+.tmp-final/

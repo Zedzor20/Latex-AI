@@ -51,6 +51,7 @@ export function providerOfModel(modelName: string): ModelProvider {
   if (lower.startsWith("openrouter/")) return "openrouter";
   if (lower.startsWith("minimax/")) return "minimax";
   if (lower.startsWith("groq/")) return "groq";
+  if (lower.startsWith("ollama/")) return "ollama";
   return "gemini";
 }
 
@@ -126,5 +127,7 @@ export const PROVIDER_LABELS: Record<ModelProvider, string> = {
   openrouter: "OpenRouter",
   minimax: "MiniMax",
   groq: "Groq",
-  puter: "Puter"
+  puter: "Puter",
+  ollama: "Ollama",
+  omniroute: "OmniRoute"
 };

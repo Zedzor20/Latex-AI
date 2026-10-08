@@ -1,6 +1,8 @@
 import type { Attachment, GeminiModel, ModelProvider, ProviderError } from "../shared/types.js";
+import { imageGenerationCapability, thinkingCapabilityOfModel } from "../shared/modelCapabilities.js";
 import { classifyHttpStatus, classifyNetworkError } from "../shared/types.js";
 import { safeExtractMessage } from "../shared/safeMessage.js";
+import { attachmentBlock, filesOf, imageBytes, imageDataUrl, imagesOf, logVision } from "../shared/vision.js";
 import type { AIProvider, GeminiChunk, GeminiGenerateInput } from "./geminiProvider.js";
 
 /** OpenAI-compatible endpoints. */
@@ -9,7 +11,9 @@ const ENDPOINTS: Record<ModelProvider, { base: string; label: string }> = {
   openrouter: { base: "https://openrouter.ai/api/v1", label: "OpenRouter" },
   minimax: { base: "https://api.minimax.io/v1", label: "MiniMax" },
   groq: { base: "https://api.groq.com/openai/v1", label: "Groq" },
-  puter: { base: "", label: "Puter" }
+  puter: { base: "", label: "Puter" },
+  ollama: { base: "http://localhost:11434/v1", label: "Ollama" },
+  omniroute: { base: "http://localhost:20128/v1", label: "OmniRoute" }
 };
 
 const DEFAULT_MAX_TOKENS = 8192;
@@ -61,6 +65,36 @@ export function toolsToOpenAi(tools: unknown[] | undefined): Array<Record<string
   }));
 }
 
+/** Parse a `data:<mime>;base64,<payload>` URL into provider image data. */
+function dataUrlToImage(url: string): { mimeType: string; data: string } | null {
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/is.exec(url);
+  if (!match) return null;
+  const mimeType = (match[1] || "image/png").trim().toLowerCase();
+  const base64 = (match[3] || "").replace(/\s+/g, "");
+  if (!base64) return null;
+  return { mimeType, data: base64 };
+}
+
+/**
+ * Fetch a provider-hosted generated image and return it as base64. Bounded in
+ * size, and it only ever accepts an `image/*` content type — a model response
+ * can never point Latex at arbitrary non-image content.
+ */
+async function fetchImageAsBase64(url: string, signal?: AbortSignal): Promise<{ mimeType: string; data: string } | null> {
+  const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+  try {
+    const res = await fetch(url, signal ? { signal } : {});
+    if (!res.ok) return null;
+    const mimeType = (res.headers.get("content-type") || "image/png").split(";")[0].trim().toLowerCase();
+    if (!mimeType.startsWith("image/")) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.byteLength === 0 || buf.byteLength > MAX_IMAGE_BYTES) return null;
+    return { mimeType, data: buf.toString("base64") };
+  } catch {
+    return null;
+  }
+}
+
 /** Normalize a model id for the provider API: strip Latex prefixes. */
 function normalizeModelId(id: string): string {
   return id
@@ -81,8 +115,10 @@ export function inferCapabilities(model: GeminiModel): { supportsTools?: boolean
   // Vision: model or description mentions vision/multimodal/image
   const supportsVision = /vision|multimodal|image/.test(combined);
 
-  // Reasoning: chain-of-thought / reasoning models
-  const supportsReasoning = /reason|think|thinking|deepseek.r1|deepseek.reasoner/.test(combined);
+  // Reasoning: shared, provider-aware capability (one source of truth). A name
+  // containing "reason"/"think" is NOT enough — the capability module checks
+  // that this provider/endpoint really exposes reasoning text to the adapter.
+  const supportsReasoning = thinkingCapabilityOfModel(model).supportsThinking;
 
   // Tool calling: explicitly excluded non-chat models first, then check for
   // instruction-tuned / chat / general-purpose model indicators.
@@ -135,21 +171,75 @@ export class OpenAiCompatibleProvider implements AIProvider {
       role: message.role === "model" ? "assistant" : "user",
       content: message.parts.map((part) => part.text).join("")
     }));
+    // ── Vision pipeline ─────────────────────────────────────────────────
+    // 1) Replay images persisted per message (follow-ups keep image context).
+    // 2) Fresh attachments go on the last user message — never duplicated.
+    let visionImages = 0;
+    let visionBytes = 0;
+    input.messages.forEach((source, index) => {
+      const imgs = imagesOf(source.attachments);
+      const fileParts = filesOf(source.attachments);
+      if (imgs.length === 0 && fileParts.length === 0) return;
+      const contentParts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+      const existing = source.parts.map((part) => part.text).join("");
+      if (existing.trim()) contentParts.push({ type: "text", text: existing });
+      // Replay persisted FILE content — visible messages stay compact (file
+      // text lives only in meta), so the request layer re-injects it here.
+      if (fileParts.length > 0) contentParts.push({ type: "text", text: fileParts.map(attachmentBlock).join("") });
+      for (const att of imgs) {
+        const url = imageDataUrl(att);
+        if (!url) {
+          throw classifyHttpStatus(this.provider, input.model, 400, `Image "${att.name ?? "attachment"}" could not be prepared for the model (invalid image data). The image was NOT sent as text instead.`);
+        }
+        contentParts.push({ type: "image_url", image_url: { url } });
+        visionImages += 1;
+        visionBytes += imageBytes([att]);
+      }
+      (messages[index] as Record<string, unknown>).content = contentParts;
+    });
     const attachments = input.attachments?.filter((a) => a.kind === "text" || a.kind === "image");
-    if (attachments?.length) {
-      const last = messages[messages.length - 1];
+    const lastIndex = messages.length - 1;
+    const lastSource = input.messages[lastIndex];
+    const lastAlreadyHasImages = imagesOf(lastSource?.attachments).length > 0;
+    // File attachments already replayed from the last message's meta — never send twice.
+    const carriedFileNames = new Set(filesOf(lastSource?.attachments).map((a) => a.name));
+    if (attachments?.length && !lastAlreadyHasImages) {
+      const last = messages[lastIndex];
       if (last && last.role === "user") {
-        const blocks: string[] = [];
-        for (const att of attachments) {
-          if (att.kind === "image" && att.base64 && att.mimeType) {
-            blocks.push(`\n\n[Image attachment: ${att.name}]\n`);
-          } else if (att.content) {
-            blocks.push(`\n\n[Attachment: ${att.name}]\n${att.content}`);
+        // Check if any image attachments exist — if so, convert to content array format
+        const hasImages = attachments.some((a) => a.kind === "image" && a.base64);
+        if (hasImages) {
+          // OpenAI vision format: content array with text and image_url parts
+          const contentParts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+          // Keep existing text as first part
+          if (typeof last.content === "string" && last.content.trim()) {
+            contentParts.push({ type: "text", text: last.content });
+          }
+          for (const att of attachments) {
+            if (att.kind === "image") {
+              const url = imageDataUrl(att);
+              if (!url) {
+                throw classifyHttpStatus(this.provider, input.model, 400, `Image "${att.name ?? "attachment"}" could not be prepared for the model (invalid image data). The image was NOT sent as text instead.`);
+              }
+              contentParts.push({ type: "image_url", image_url: { url } });
+              visionImages += 1;
+              visionBytes += imageBytes([att]);
+            } else if (att.content && !carriedFileNames.has(att.name)) {
+              contentParts.push({ type: "text", text: `\n[Attachment: ${att.name}]\n${att.content}` });
+            }
+          }
+          (last as Record<string, unknown>).content = contentParts;
+        } else {
+          // Text-only attachments — append as string
+          for (const att of attachments) {
+            if (att.content && !carriedFileNames.has(att.name)) {
+              last.content += `\n\n[Attachment: ${att.name}]\n${att.content}`;
+            }
           }
         }
-        last.content += blocks.join("");
       }
     }
+    logVision(this.provider, visionImages, visionBytes, messages.length);
 
     const body: Record<string, unknown> = {
       model: normalizeModelId(input.model),
@@ -158,6 +248,13 @@ export class OpenAiCompatibleProvider implements AIProvider {
       max_tokens: input.maxOutputTokens || DEFAULT_MAX_TOKENS,
       stream: true
     };
+    // Image output is REQUESTED only for a model whose capability says the
+    // provider returns generated image data — a normal text turn never carries
+    // `modalities`, so text-only models (and providers that reject the field)
+    // are completely unaffected.
+    if (imageGenerationCapability(this.provider, input.model).supportsImageGeneration) {
+      body.modalities = ["text", "image"];
+    }
     const openAiTools = toolsToOpenAi(input.tools);
     if (openAiTools && openAiTools.length > 0) body.tools = openAiTools;
 
@@ -209,8 +306,13 @@ export class OpenAiCompatibleProvider implements AIProvider {
     let buffer = "";
     // Accumulate tool call arguments across streaming chunks
     const toolCallAccum = new Map<number, { id: string; name: string; argsJson: string }>();
+    // `[DONE]` ends the STREAM, not the generator: returning here used to skip
+    // the "yield accumulated tool calls" step below, so every native function
+    // call from an OpenAI-compatible provider (OpenRouter, Groq, MiniMax, …)
+    // was silently discarded and the agent appeared to do nothing at all.
+    let streamEnded = false;
     try {
-      while (true) {
+      while (!streamEnded) {
         const { value, done } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -218,11 +320,15 @@ export class OpenAiCompatibleProvider implements AIProvider {
         const events = buffer.split(/\r?\n\r?\n/);
         buffer = events.pop() ?? "";
         for (const event of events) {
+          if (streamEnded) break;
           const lines = event.split(/\r?\n/);
           for (const line of lines) {
             if (!line.startsWith("data:")) continue;
             const payload = line.slice(line.charAt(5) === " " ? 6 : 5).trim();
-            if (payload === "[DONE]") return;
+            if (payload === "[DONE]") {
+              streamEnded = true;
+              break;
+            }
             let parsed: Record<string, unknown>;
             try {
               parsed = JSON.parse(payload);
@@ -246,6 +352,27 @@ export class OpenAiCompatibleProvider implements AIProvider {
             }
             const delta = choice.delta ?? choice.message;
             if (!delta) continue;
+            // ── Reasoning / thinking content ──
+            // OpenAI-compatible providers surface reasoning under different
+            // fields: `reasoning_content` (DeepSeek/Groq/OmniRoute), `reasoning`
+            // (OpenRouter), and `reasoning_details` (MiniMax M2, an array of
+            // typed parts). All are normalized to one reasoning channel.
+            const reasoning = (delta as Record<string, unknown>).reasoning_content
+              ?? (delta as Record<string, unknown>).reasoning
+              ?? (delta as Record<string, unknown>).reasoning_details;
+            if (typeof reasoning === "string" && reasoning) {
+              yield { type: "reasoning", text: reasoning };
+            } else if (Array.isArray(reasoning)) {
+              for (const part of reasoning) {
+                if (!part) continue;
+                const type = typeof part === "object" ? String((part as { type?: unknown }).type ?? "") : "";
+                // Only reasoning text parts — never echo a non-reasoning detail.
+                if (type && !/reason/i.test(type)) continue;
+                const text = typeof part === "string" ? part : (part as { text?: unknown }).text;
+                if (typeof text === "string" && text) yield { type: "reasoning", text };
+              }
+            }
+            // Also handle <think>...</think> blocks in text for models that embed thinking in content
             // ── Text content ──
             const content = delta.content;
             if (typeof content === "string" && content) {
@@ -254,6 +381,34 @@ export class OpenAiCompatibleProvider implements AIProvider {
               for (const part of content) {
                 const t = typeof part === "string" ? part : part?.text;
                 if (t) yield { type: "text", text: t };
+              }
+            }
+            // ── Inline image output ──
+            // Image-capable OpenAI-compatible models return the picture as an
+            // inline image part (or an `images` array). It is handed to the
+            // agent on its own channel — never as text, never as a tool call.
+            // No image part → no event.
+            const imageUrls: string[] = [];
+            if (Array.isArray(content)) {
+              for (const part of content) {
+                const url = (part as { image_url?: { url?: unknown } } | null)?.image_url?.url;
+                if (typeof url === "string" && url) imageUrls.push(url);
+              }
+            }
+            const imagesField = (delta as Record<string, unknown>).images;
+            if (Array.isArray(imagesField)) {
+              for (const img of imagesField) {
+                const url = typeof img === "string"
+                  ? img
+                  : ((img as { image_url?: { url?: unknown } })?.image_url?.url ?? (img as { url?: unknown })?.url);
+                if (typeof url === "string" && url) imageUrls.push(url);
+              }
+            }
+            for (const imageUrl of imageUrls) {
+              const parsedImage = dataUrlToImage(imageUrl)
+                ?? await fetchImageAsBase64(imageUrl, input.signal).catch(() => null);
+              if (parsedImage) {
+                yield { type: "image", mimeType: parsedImage.mimeType, data: parsedImage.data };
               }
             }
             // ── Tool calls (streamed incrementally) ──

@@ -1,6 +1,8 @@
 import type { Attachment, GeminiModel, ProviderError } from "../shared/types.js";
+import { imageGenerationCapability, thinkingCapability } from "../shared/modelCapabilities.js";
 import { classifyHttpStatus } from "../shared/types.js";
 import { safeExtractMessage } from "../shared/safeMessage.js";
+import { attachmentBlock, filesOf, imagesOf, logVision, normalizeImageAttachment } from "../shared/vision.js";
 
 export interface AIProvider {
   testConnection(): Promise<void>;
@@ -11,17 +13,43 @@ export interface AIProvider {
 export interface GeminiGenerateInput {
   model: string;
   system: string;
-  messages: { role: "user" | "model"; parts: Array<{ text: string }> }[];
+  /**
+   * Transcript messages. `attachments` carries the images persisted in a
+   * message's meta so VISION CONTEXT IS REPLAYED on follow-up prompts —
+   * not just the current turn's fresh attachments.
+   */
+  messages: { role: "user" | "model"; parts: Array<{ text: string }>; attachments?: Attachment[] }[];
   attachments?: Attachment[];
   tools?: unknown[];
   temperature: number;
   maxOutputTokens: number;
+  /**
+   * Whether the caller wants provider-side thinking.
+   *
+   * `undefined` → the model's real capability decides (default ON when the
+   * provider API exposes reasoning). An explicit `false` is a user choice and
+   * suppresses the reasoning-control parameter (Gemini `includeThoughts`).
+   * Only providers that require a control parameter read this.
+   */
+  thinking?: boolean;
   /** Optional abort signal to cancel the generation mid-stream. */
   signal?: AbortSignal;
+  /**
+   * What the user is asking for: a text answer, or an image.
+   *
+   * OmniRoute serves those on two DIFFERENT endpoints and rejects an
+   * image-generation model posted to `/v1/chat/completions`, so a provider that
+   * can do both must be told which one this turn is. `undefined` means chat,
+   * which keeps every existing caller's behaviour unchanged.
+   */
+  intent?: import("../shared/imageRouting.js").RequestIntent;
 }
 
 export type GeminiChunk =
   | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
+  /** Real generated image data returned inline by an image-output model. */
+  | { type: "image"; mimeType: string; data: string }
   | { type: "functionCall"; name: string; args: Record<string, unknown> };
 
 /** Model name tokens that do not serve Latex's text/agent conversation. */
@@ -89,24 +117,62 @@ export class GeminiProvider implements AIProvider {
   async *generate(input: GeminiGenerateInput): AsyncGenerator<GeminiChunk> {
     const model = normalizeModelId(input.model);
     const url = `https://generativelanguage.googleapis.com/v1beta/${model}:streamGenerateContent?alt=sse&key=${this.apiKey}`;
-    const contents = input.messages.map((message) => ({
-      role: message.role,
-      parts: [...message.parts.map((part) => ({ text: part.text }))] as ContentPart[]
-    }));
+    // ── Vision pipeline ─────────────────────────────────────────────────
+    // 1) Replay images persisted in each message's meta (follow-up prompts
+    //    keep their image context). 2) Attach this turn's fresh attachments
+    //    to the last user message — but never duplicate images the message
+    //    already carries. Every image is normalized (raw base64 + MIME).
+    let visionImages = 0;
+    let visionBytes = 0;
+    const contents = input.messages.map((message) => {
+      const parts: ContentPart[] = message.parts.map((part) => ({ text: part.text }));
+      for (const att of imagesOf(message.attachments)) {
+        const norm = normalizeImageAttachment(att);
+        if (norm) {
+          parts.push({ inlineData: { mimeType: norm.mimeType, data: norm.base64 } });
+          visionImages += 1;
+          visionBytes += norm.bytes;
+        }
+      }
+      // Replay persisted FILE content — the visible message stays compact
+      // (content lives only in meta), so the request layer re-injects it here.
+      for (const att of filesOf(message.attachments)) {
+        parts.push({ text: attachmentBlock(att) });
+      }
+      return { role: message.role, parts };
+    });
     const attachments = input.attachments?.filter((a) => a.kind === "image" || a.kind === "text");
-    if (attachments?.length) {
-      const last = contents[contents.length - 1];
+    const lastIndex = contents.length - 1;
+    const lastSource = input.messages[lastIndex];
+    const lastAlreadyHasImages = imagesOf(lastSource?.attachments).length > 0;
+    // File attachments already replayed from the last message's meta — never send twice.
+    const carriedFileNames = new Set(filesOf(lastSource?.attachments).map((a) => a.name));
+    if (attachments?.length && !lastAlreadyHasImages) {
+      const last = contents[lastIndex];
       if (last && last.role === "user") {
         for (const att of attachments) {
-          if (att.kind === "image" && att.base64 && att.mimeType) {
-            last.parts.push({ inlineData: { mimeType: att.mimeType, data: att.base64 } });
-          } else if (att.content) {
+          if (att.kind === "image") {
+            const norm = normalizeImageAttachment(att);
+            if (!norm) {
+              throw classifyHttpStatus("gemini", input.model, 400, `Image "${att.name ?? "attachment"}" could not be prepared for the model (invalid image data). The image was NOT sent as text instead.`);
+            }
+            last.parts.push({ inlineData: { mimeType: norm.mimeType, data: norm.base64 } });
+            visionImages += 1;
+            visionBytes += norm.bytes;
+          } else if (att.content && !carriedFileNames.has(att.name)) {
             const truncated = att.truncated ? `\n\n_(This file was truncated; showing the first ${att.content.length} characters.)_` : "";
             last.parts.push({ text: `\n\n[Attachment: ${att.name}]${truncated}\n${att.content}` });
           }
         }
       }
     }
+    logVision("gemini", visionImages, visionBytes, contents.length);
+
+    // ── Image output (only for models the provider really serves images for) ──
+    // Image-capable Gemini models return generated image data as inline parts
+    // instead of prose, but ONLY when IMAGE is among the requested response
+    // modalities. Text-only models must never receive this block.
+    const imageOutput = imageGenerationCapability("gemini", input.model).supportsImageGeneration;
 
     const res = await fetch(url, {
       method: "POST",
@@ -117,7 +183,16 @@ export class GeminiProvider implements AIProvider {
         tools: input.tools,
         generationConfig: {
           temperature: input.temperature,
-          maxOutputTokens: input.maxOutputTokens
+          maxOutputTokens: input.maxOutputTokens,
+          ...(imageOutput ? { responseModalities: ["TEXT", "IMAGE"] } : {}),
+          // ── Provider-exposed thinking (only when the MODEL supports it) ──
+          // Gemini returns human-readable thought summaries as parts flagged
+          // `thought: true`, but ONLY when includeThoughts is enabled. Models
+          // without thinking (1.x/2.0, imagen, embedding, …) must never receive
+          // this block — they reject it, which would break normal requests.
+          ...((input.thinking ?? thinkingCapability("gemini", input.model).supportsThinking)
+            ? { thinkingConfig: { includeThoughts: true } }
+            : {})
         }
       }),
       signal: input.signal
@@ -163,7 +238,27 @@ export class GeminiProvider implements AIProvider {
               const text = typeof rawText === "string" ? rawText
                 : rawText != null && typeof rawText === "object" ? safeExtractMessage(rawText) || ""
                 : String(rawText ?? "");
-              if (text) yield { type: "text", text };
+              if (text) {
+                // ── Thinking vs answer channel ─────────────────────────────
+                // A thought summary is the model's OWN reasoning summary, and
+                // it belongs in the Thinking box — never in the assistant text
+                // and never in the execution timeline. The two streams are
+                // tagged here so the renderer can keep them separate.
+                if (part.thought === true) yield { type: "reasoning", text };
+                else yield { type: "text", text };
+              }
+            }
+            // ── Real image output ─────────────────────────────────────
+            // Generated image data arrives as an inline part. It is handed to
+            // the agent on its own channel so it can NEVER be mixed into the
+            // assistant text or the activity timeline. No image part → no event.
+            const inline = part.inlineData;
+            if (inline?.data && typeof inline.data === "string") {
+              yield {
+                type: "image",
+                mimeType: inline.mimeType && typeof inline.mimeType === "string" ? inline.mimeType : "image/png",
+                data: inline.data
+              };
             }
             if (part.functionCall) yield { type: "functionCall", name: part.functionCall.name, args: part.functionCall.args ?? {} };
           }
@@ -190,7 +285,13 @@ export class GeminiProvider implements AIProvider {
   }
 }
 
-type ContentPart = { text?: string; inlineData?: { mimeType: string; data: string } };
+type ContentPart = {
+  text?: string;
+  /** Input image (image editing) OR generated image output, per Gemini. */
+  inlineData?: { mimeType: string; data: string };
+  /** Gemini thought summary part (reasoning exposed by the API). */
+  thought?: boolean;
+};
 
 async function geminiError(res: Response, fallback: string): Promise<string> {
   try {

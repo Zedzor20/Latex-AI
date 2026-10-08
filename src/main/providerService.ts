@@ -4,6 +4,8 @@ import { safeExtractMessage } from "../shared/safeMessage.js";
 import { GeminiProvider } from "./geminiProvider.js";
 import { OpenAiCompatibleProvider } from "./openaiProvider.js";
 import { PuterProvider } from "./puterProvider.js";
+import { OllamaProvider } from "./ollamaProvider.js";
+import { OmniRouteProvider } from "./omnirouteProvider.js";
 import type { AIProvider } from "./geminiProvider.js";
 
 const PROVIDER_LABELS: Record<ModelProvider, string> = {
@@ -11,7 +13,9 @@ const PROVIDER_LABELS: Record<ModelProvider, string> = {
   openrouter: "OpenRouter",
   minimax: "MiniMax",
   groq: "Groq",
-  puter: "Puter"
+  puter: "Puter",
+  ollama: "Ollama",
+  omniroute: "OmniRoute"
 };
 
 /** Keys that map a model name to its provider (default: gemini). */
@@ -21,6 +25,8 @@ export function providerOfModel(modelName: string): ModelProvider {
   if (lower.startsWith("openrouter/")) return "openrouter";
   if (lower.startsWith("minimax/")) return "minimax";
   if (lower.startsWith("groq/")) return "groq";
+  if (lower.startsWith("ollama/")) return "ollama";
+  if (lower.startsWith("omniroute/")) return "omniroute";
   return "gemini";
 }
 
@@ -165,6 +171,15 @@ export class ProviderFactory {
       const token = this.getPuterToken ? this.getPuterToken() : null;
       return new PuterProvider(token);
     }
+    if (provider === "ollama") {
+      // Ollama needs no API key — connection is verified against the local server.
+      return new OllamaProvider();
+    }
+    if (provider === "omniroute") {
+      // OmniRoute is a local gateway — uses optional API key.
+      const apiKey = this.getKey(provider);
+      return new OmniRouteProvider(undefined, apiKey ?? undefined);
+    }
     const apiKey = this.getKey(provider);
     if (!apiKey) return undefined;
     if (provider === "gemini") return new GeminiProvider(apiKey);
@@ -180,18 +195,35 @@ export class ProviderFactory {
 
   /** Discover models from every configured provider, deduped and qualified. */
   async listAllModels(forceRefresh = false): Promise<GeminiModel[]> {
-    const providers: ModelProvider[] = ["gemini", "openrouter", "minimax", "groq", "puter"];
+    const providers: ModelProvider[] = ["gemini", "openrouter", "minimax", "groq", "puter", "ollama", "omniroute"];
     const results = await Promise.allSettled(providers.map((provider) => {
       const impl = this.getProvider(provider);
       return impl ? impl.listModels(forceRefresh).then((list) => ({ provider, list })) : Promise.resolve({ provider, list: [] as GeminiModel[] });
     }));
     const seen = new Set<string>();
     const all: GeminiModel[] = [];
+    // Only genuinely non-conversational endpoints are hidden. NVIDIA/Nemotron
+    // models were previously excluded here, which removed every Nemotron entry
+    // from the picker even when the provider served it — they are normal chat
+    // and tool-calling models and must stay selectable.
+    // Only genuinely non-conversational endpoints are hidden here.
+    //
+    // Image MODELS are deliberately NOT excluded any more: `dall-e`, `*flux*`,
+    // `stable-diffusion`, `image-gen` and friends are exactly the models an
+    // explicit image request must be routed to, and hiding them made Latex look
+    // for an image target in a catalog it had itself emptied — after which the
+    // request fell back onto a text model. An image model is a first-class
+    // selectable model; `supportsVision`/`supportsImageGeneration` describe what
+    // it can do, and the request path decides whether to use it.
+    const EXCLUDED_PATTERNS = /(?:^|[\/_-])(embed|embedding|embed-|rerank|whisper|tts|speech|moderation)/i;
     for (const result of results) {
       if (result.status !== "fulfilled") continue;
       for (const model of result.value.list) {
         const qualified = qualifyModel({ ...model, provider: model.provider ?? result.value.provider });
         if (seen.has(qualified.name)) continue;
+        // Skip embeddings/audio/moderation endpoints — never chat models.
+        const searchStr = `${qualified.name} ${qualified.displayName ?? ''} ${qualified.description ?? ''}`;
+        if (EXCLUDED_PATTERNS.test(searchStr)) continue;
         seen.add(qualified.name);
         all.push(qualified);
       }
@@ -202,10 +234,10 @@ export class ProviderFactory {
   /** Status of every provider (configured or not) for the settings UI. */
   statuses(): ProviderStatus[] {
     const puterConnected = this.getPuterToken ? Boolean(this.getPuterToken()) : false;
-    return (["gemini", "openrouter", "minimax", "groq", "puter"] as ModelProvider[]).map((provider) => ({
+    return (["gemini", "openrouter", "minimax", "groq", "puter", "ollama", "omniroute"] as ModelProvider[]).map((provider) => ({
       provider,
       label: PROVIDER_LABELS[provider],
-      configured: provider === "puter" ? puterConnected : Boolean(this.getKey(provider))
+      configured: provider === "puter" ? puterConnected : provider === "ollama" ? true : provider === "omniroute" ? true : Boolean(this.getKey(provider))
     }));
   }
 
@@ -223,7 +255,7 @@ export class ProviderFactory {
     error?: string;
     httpStatus?: number;
   }>> {
-    const providers: ModelProvider[] = ["gemini", "openrouter", "minimax", "groq", "puter"];
+    const providers: ModelProvider[] = ["gemini", "openrouter", "minimax", "groq", "puter", "ollama", "omniroute"];
     const results = await Promise.allSettled(providers.map(async (provider) => {
       const impl = this.getProvider(provider);
       if (!impl) {

@@ -90,10 +90,28 @@ function destructivePolicy(args: Record<string, unknown>, settings: LatexSetting
   return { needed: true, destructive: true, reason: "This operation permanently removes files or folders." };
 }
 
+/**
+ * The permission mode that actually governs command execution.
+ *
+ * Settings → Workspace describes its Autonomous option as "Apply changes AND
+ * run commands without asking", and the composer's mode pill writes only
+ * `approvalMode`. Reading `terminalApprovalMode` alone therefore left the
+ * execution layer asking for approval while the UI said Autonomous — the mode
+ * never reached the layer that runs the command.
+ *
+ * Autonomous is the only level that crosses over: it is an explicit, whole-app
+ * "do not ask me" choice. Every other level keeps the dedicated Command
+ * Approval setting, so a user who wants commands gated can still gate them.
+ */
+function effectiveCommandApproval(settings: LatexSettings): ApprovalMode {
+  if (filesystemApproval(settings) === "autonomous") return "autonomous";
+  return terminalApproval(settings);
+}
+
 function commandPolicy(args: Record<string, unknown>, settings: LatexSettings): ApprovalPolicy {
   const command = asString(args.command);
   const dangerous = isDangerousCommand(command);
-  const mode = terminalApproval(settings);
+  const mode = effectiveCommandApproval(settings);
   if (mode === "autonomous") return { needed: false, destructive: dangerous, reason: "Autonomous mode runs commands without approval." };
   if (mode === "trusted" && !dangerous) return { needed: false, destructive: false, reason: "Trusted commands run without approval." };
   if (mode === "destructive" && !dangerous) return { needed: false, destructive: false, reason: "Safe command allowed by your terminal settings." };
@@ -132,7 +150,7 @@ function resolvePcPreview(ctx: ToolContext, _args: Record<string, unknown>, fall
   return Promise.resolve(fallback);
 }
 
-const registry: ToolDef[] = [
+export const registry: ToolDef[] = [
   {
     name: "list_directory",
     description: "List files in a directory (relative to the workspace, or an absolute path in Full PC Access mode).",
@@ -198,7 +216,17 @@ const registry: ToolDef[] = [
       const content = asString(args.content);
       return `Creating new file: ${rel}\n\n${content.slice(0, 2000)}`;
     },
-    execute: (ctx, args) => ctx.fileTools.createFile(ctx.workspace?.path, asString(args.relativePath), asString(args.content))
+    execute: async (ctx, args) => {
+      const rel = asString(args.relativePath);
+      const content = asString(args.content);
+      const result = await ctx.fileTools.createFile(ctx.workspace?.path, rel, content);
+      // Only a REAL create shows up in the review card.
+      if (result.success) {
+        const change = await ctx.fileTools.prepareCreate(ctx.workspace?.path, rel, content).catch(() => null);
+        if (change) ctx.collectChange(change);
+      }
+      return result;
+    }
   },
   {
     name: "write_file",
@@ -241,7 +269,20 @@ const registry: ToolDef[] = [
     requiresWorkspace: true,
     approvalPolicy: mutationPolicy,
     preview: (ctx, args) => Promise.resolve(`Copy ${asString(args.from)} → ${asString(args.to)}`),
-    execute: (ctx, args) => ctx.fileTools.copyFile(ctx.workspace?.path, asString(args.from), asString(args.to))
+    execute: async (ctx, args) => {
+      const to = asString(args.to);
+      const result = await ctx.fileTools.copyFile(ctx.workspace?.path, asString(args.from), to);
+      if (result.success && to) {
+        // The copy really exists now — read the final content and record it as
+        // a created file (the source is named in the description).
+        const content = await ctx.fileTools.readFile(ctx.workspace?.path, to).catch(() => null);
+        if (content !== null) {
+          const change = await ctx.fileTools.prepareCreate(ctx.workspace?.path, to, content).catch(() => null);
+          if (change) ctx.collectChange({ ...change, description: `Copied from \`${asString(args.from)}\`` });
+        }
+      }
+      return result;
+    }
   },
   {
     name: "rename_file",
@@ -250,7 +291,15 @@ const registry: ToolDef[] = [
     requiresWorkspace: true,
     approvalPolicy: mutationPolicy,
     preview: (ctx, args) => Promise.resolve(`Rename ${asString(args.from)} → ${asString(args.to)}`),
-    execute: (ctx, args) => ctx.fileTools.renameFile(ctx.workspace?.path, asString(args.from), asString(args.to))
+    execute: async (ctx, args) => {
+      const from = asString(args.from);
+      const to = asString(args.to);
+      const change = await ctx.fileTools.prepareRename(ctx.workspace?.path, from, to).catch(() => null);
+      const result = await ctx.fileTools.renameFile(ctx.workspace?.path, from, to);
+      // The review entry exists only when the rename really happened.
+      if (result.success && change) ctx.collectChange(change);
+      return result;
+    }
   },
   {
     name: "create_directory",
@@ -268,7 +317,15 @@ const registry: ToolDef[] = [
     requiresWorkspace: true,
     approvalPolicy: destructivePolicy,
     preview: (ctx, args) => Promise.resolve(`Delete file: ${asString(args.relativePath)}`),
-    execute: (ctx, args) => ctx.fileTools.deleteFile(ctx.workspace?.path, asString(args.relativePath))
+    execute: async (ctx, args) => {
+      const rel = asString(args.relativePath);
+      // Capture what is about to disappear so the review can show the removal
+      // (and undo can put the file back) — only recorded if the delete worked.
+      const change = await ctx.fileTools.prepareDelete(ctx.workspace?.path, rel).catch(() => null);
+      const result = await ctx.fileTools.deleteFile(ctx.workspace?.path, rel);
+      if (result.success && change) ctx.collectChange(change);
+      return result;
+    }
   },
   {
     name: "delete_directory",

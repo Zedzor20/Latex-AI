@@ -1,5 +1,5 @@
 import { Bug, Code2, Rocket, SearchCheck } from "lucide-react";
-import logo from "../assets/latex-logo.svg";
+import logo from "../assets/latex-logo.png";
 
 const quickActions = [
   {
@@ -28,6 +28,14 @@ const quickActions = [
   }
 ];
 
+/**
+ * The start screen: shown on startup and whenever no chat is open.
+ *
+ * Latex never loads a conversation into the centre on its own — the sidebar is
+ * the list, and opening something is the user's choice. The composer below is
+ * already live, so the first message can be typed without picking a chat, and
+ * the quick actions start one directly.
+ */
 export function HomeScreen({ onStartPrompt }: { onStartPrompt: (prompt: string) => void }) {
   return (
     <div className="home">

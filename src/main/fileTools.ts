@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import fg from "fast-glob";
 import { createTwoFilesPatch } from "diff";
 import type { FileOperationResult, FileTreeNode, FilesystemAccess, PendingChange, WorkspaceInfo } from "../shared/types.js";
+import { changeKindOf, describeFileChange, editNote } from "./taskSummary.js";
 import { ensureInsideWorkspace, fullAccessPath, id, realSafePath, safePath } from "./security.js";
 
 const TEXT_EXTENSIONS = new Set([
@@ -206,7 +207,46 @@ export class FileTools {
     const existed = await exists(target);
     const previousContent = existed ? await fs.readFile(target, "utf8") : "";
     const diff = createTwoFilesPatch(relativePath, relativePath, previousContent, nextContent, "", "");
-    return { id: id("change"), filePath: relativePath, previousContent, nextContent, diff, status: "pending", existed };
+    const kind = changeKindOf(existed, nextContent);
+    return {
+      id: id("change"), filePath: relativePath, previousContent, nextContent, diff, status: "pending", existed, kind, operations: 1,
+      description: describeFileChange(kind, nextContent.split("\n").length, 1)
+    };
+  }
+
+  /** Change record for a file this turn brought into existence (copy/new file). */
+  async prepareCreate(workspaceRoot: string | undefined, relativePath: string, content: string): Promise<PendingChange> {
+    const diff = createTwoFilesPatch(relativePath, relativePath, "", content, "", "");
+    return {
+      id: id("change"), filePath: relativePath, previousContent: "", nextContent: content, diff, status: "pending", existed: false,
+      kind: "created", operations: 1, description: describeFileChange("created", content.split("\n").length, 1)
+    };
+  }
+
+  /**
+   * Change record for a deletion: the diff shows the content that went away, so
+   * a removed file is visible in the review (and can be restored by undo).
+   */
+  async prepareDelete(workspaceRoot: string | undefined, relativePath: string): Promise<PendingChange> {
+    const target = await this.resolvePath(workspaceRoot, relativePath);
+    const previousContent = await fs.readFile(target, "utf8").catch(() => "");
+    const diff = createTwoFilesPatch(relativePath, relativePath, previousContent, "", "", "");
+    const lines = previousContent.split("\n").length;
+    return {
+      id: id("change"), filePath: relativePath, previousContent, nextContent: "", diff, status: "pending", existed: true,
+      kind: "deleted", operations: 1, description: `Deleted during this task (${lines} line${lines === 1 ? "" : "s"} removed)`
+    };
+  }
+
+  /** Change record for a rename/move — the review shows `from → to`. */
+  async prepareRename(workspaceRoot: string | undefined, from: string, to: string): Promise<PendingChange> {
+    const source = await this.resolvePath(workspaceRoot, from);
+    const content = await fs.readFile(source, "utf8").catch(() => "");
+    const diff = createTwoFilesPatch(from, to, content, content, "", "");
+    return {
+      id: id("change"), filePath: to, renamedFrom: from, previousContent: content, nextContent: content, diff,
+      status: "pending", existed: true, kind: "renamed", operations: 1, description: `Renamed \`${from}\` → \`${to}\``
+    };
   }
 
   /** Build a pending change for a targeted oldText → newText edit. */
@@ -219,7 +259,15 @@ export class FileTools {
     if (!edited || edited.count === 0) throw new Error(`The requested text was not found in ${relativePath}.`);
     const nextContent = edited.next;
     const diff = createTwoFilesPatch(relativePath, relativePath, current, nextContent, "", "");
-    return { change: { id: id("change"), filePath: relativePath, previousContent: current, nextContent, diff, status: "pending", existed: true }, matches: edited.count };
+    return {
+      change: {
+        id: id("change"), filePath: relativePath, previousContent: current, nextContent, diff, status: "pending", existed: true,
+        kind: nextContent === "" ? "deleted" : "modified",
+        operations: 1,
+        description: describeFileChange(nextContent === "" ? "deleted" : "modified", nextContent.split("\n").length, 1, editNote(oldText))
+      },
+      matches: edited.count
+    };
   }
 
   // ---------- mutations (each writes then verifies against disk) ----------

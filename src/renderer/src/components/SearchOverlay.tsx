@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Bot, FileCode2, FolderOpen, Search } from "lucide-react";
+import { Bot, FileCode2, FolderOpen, Search, Terminal } from "lucide-react";
 import type { Conversation, Workspace } from "../../../shared/types";
 import { timeAgo } from "../lib/format";
 import { Modal } from "./ui";
@@ -10,15 +10,17 @@ interface SearchOverlayProps {
   files: string[];
   onSelectConversation: (conversation: Conversation) => void;
   onSelectWorkspace: (workspace: Workspace) => void;
+  onOpenTerminal?: () => void;
   onClose: () => void;
 }
 
 interface Result {
-  kind: "conversation" | "project" | "file";
+  kind: "conversation" | "project" | "file" | "action";
   label: string;
   meta: string;
   conversation?: Conversation;
   workspace?: Workspace;
+  onAction?: () => void;
 }
 
 export function SearchOverlay({
@@ -27,6 +29,7 @@ export function SearchOverlay({
   files,
   onSelectConversation,
   onSelectWorkspace,
+  onOpenTerminal,
   onClose
 }: SearchOverlayProps) {
   const [query, setQuery] = useState("");
@@ -53,6 +56,10 @@ export function SearchOverlay({
     for (const f of files) {
       if (f.toLowerCase().includes(q)) list.push(build("file", f.split("/").pop() ?? f, f));
     }
+    // Add built-in actions
+    if ("terminal".includes(q) || "terminal".startsWith(q)) {
+      list.push({ kind: "action", label: "Terminal", meta: "Open a real terminal inside Latex", onAction: onOpenTerminal });
+    }
     return list.slice(0, 30);
   }, [query, conversations, workspaces, files]);
 
@@ -61,6 +68,7 @@ export function SearchOverlay({
   const activate = (result: Result) => {
     if (result.kind === "conversation" && result.conversation) onSelectConversation(result.conversation);
     if (result.kind === "project" && result.workspace) onSelectWorkspace(result.workspace);
+    if (result.kind === "action" && result.onAction) result.onAction();
     onClose();
   };
 
@@ -104,6 +112,7 @@ export function SearchOverlay({
               {result.kind === "conversation" && <Bot size={15} />}
               {result.kind === "project" && <FolderOpen size={15} />}
               {result.kind === "file" && <FileCode2 size={15} />}
+              {result.kind === "action" && <Terminal size={15} />}
               <span className="searchRowText">
                 <span className="searchRowLabel">{result.label}</span>
                 <span className="searchRowMeta">{result.meta}</span>

@@ -7,7 +7,7 @@ const projectRoot = fileURLToPath(new URL(".", import.meta.url));
 
 export default defineConfig({
   plugins: [react()],
-  root: "src/renderer",
+  root: path.resolve(projectRoot, "src/renderer"),
   publicDir: false,
   base: "./",
   resolve: {
@@ -16,7 +16,7 @@ export default defineConfig({
     }
   },
   build: {
-    outDir: "../../dist/renderer",
+    outDir: path.resolve(projectRoot, "dist/renderer"),
     emptyOutDir: true
   },
   server: {

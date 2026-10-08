@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Brain,
   Check,
   ChevronDown,
   FileText,
@@ -19,6 +20,7 @@ import {
 import type { ApprovalMode, Attachment, GeminiModel, ModelProvider, Workspace } from "../../../shared/types";
 import { modelShortName } from "../lib/errors";
 import { modelCapability } from "../lib/format";
+import { imageGenerationBadgeLabel, imageGenerationCapabilityOfModel, modelEligibleForThinkingFilter, modelSupportsImageGeneration, thinkingCapabilityOfModel, thinkingBadgeLabel, compareThinkingModels, THINKING_FILTER_ORDER } from "../../../shared/modelCapabilities";
 
 /** Categorize Puter models into curated sections based on name/capabilities. */
 function categorizePuterModels(models: GeminiModel[]) {
@@ -46,17 +48,26 @@ import { Spinner } from "./ui";
 
 export type ModelsState = "idle" | "loading" | "ready" | "error";
 
-interface ComposerProps {
+export interface ComposerProps {
   workspace?: Workspace;
   composer: string;
   setComposer: (value: string) => void;
   onSend: () => void;
   onStop: () => void;
   busy: boolean;
+  /** Current app mode. The Thinking control is a MAIN-only concept: Chat is a
+   *  plain conversation and never shows or toggles provider reasoning. */
+  appMode?: "main" | "chat";
   approvalMode: ApprovalMode;
   onSelectApprovalMode: (mode: ApprovalMode) => void;
   showApprovalMenu: boolean;
   onToggleApprovalMenu: (open: boolean) => void;
+  /** True when the selected model's provider genuinely exposes thinking. */
+  thinkingSupported?: boolean;
+  /** Resolved Thinking state for the selected model (default ON when supported). */
+  thinkingOn?: boolean;
+  /** Persist an explicit per-model Thinking preference. */
+  onToggleThinking?: (enabled: boolean) => void;
   modelLabel: string;
   models: GeminiModel[];
   modelsState: ModelsState;
@@ -72,6 +83,7 @@ interface ComposerProps {
     provider: string; label: string; configured: boolean;
     status: "ok" | "error" | "no_key"; modelCount: number; error?: string; httpStatus?: number;
   }>;
+  onStartOllama?: () => void;
   attachments: Attachment[];
   onRemoveAttachment: (id: string) => void;
   onAddAttachments: (attachments: Attachment[]) => void;
@@ -86,6 +98,10 @@ interface ComposerProps {
   speechError: string | null;
   speaking: boolean;
   onStopSpeaking: () => void;
+  /** When the selected model is image-capable, this sends the turn to the
+   *  dedicated image-generation path instead of the normal conversation/agent
+   *  path, so Gemini-native image models actually produce a picture. */
+  onGenerateImage?: (text: string, attachments?: Attachment[]) => void;
 }
 
 const approvalOptions: Array<{ value: ApprovalMode; label: string }> = [
@@ -102,11 +118,16 @@ export function Composer(props: ComposerProps) {
     setComposer,
     onSend,
     onStop,
+    onGenerateImage,
     busy,
+    appMode,
     approvalMode,
     onSelectApprovalMode,
     showApprovalMenu,
     onToggleApprovalMenu,
+    thinkingSupported,
+    thinkingOn,
+    onToggleThinking,
     modelLabel,
     models,
     modelsState,
@@ -119,6 +140,7 @@ export function Composer(props: ComposerProps) {
     onSelectAutoModel,
     activeProvider,
     providerHealth,
+    onStartOllama,
     attachments,
     onRemoveAttachment,
     onAddAttachments,
@@ -148,6 +170,16 @@ export function Composer(props: ComposerProps) {
 
   const canSend = composer.trim().length > 0 && !busy;
 
+  // Explicit image-generation mode for image-capable models. When on, the
+  // send button routes the prompt to `onGenerateImage` (Gemini-native image
+  // models produce a picture; other providers surface an honest notice).
+  const [generateImageMode, setGenerateImageMode] = useState(false);
+  const imageCapable = useMemo(() => {
+    if (!selectedModel) return false;
+    const found = models.find((m) => m.name === selectedModel);
+    return modelSupportsImageGeneration(found ?? { name: selectedModel, provider: activeProvider as ModelProvider, capabilities: [] });
+  }, [selectedModel, models, activeProvider]);
+
   // Slash commands definition
   const slashCommands = [
     { name: "/clear", desc: "Clear this conversation" },
@@ -164,32 +196,57 @@ export function Composer(props: ComposerProps) {
 
   const imageInputRef = useRef<HTMLInputElement>(null);
 
-  // Handle image file selection via hidden file input
+  // Handle file selection via hidden file input (images + text/code/docs)
   const handleImageFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = e.target.files;
     if (!fileList || fileList.length === 0) return;
-    const files = Array.from(fileList).slice(0, 5); // max 5 images
+    const files = Array.from(fileList).slice(0, 8);
     const attachments: Attachment[] = [];
     for (const file of files) {
-      if (file.size > 4 * 1024 * 1024) continue; // skip >4MB
-      const base64 = await new Promise<string>((resolve) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = reader.result as string;
-          resolve(dataUrl.split(',')[1] || '');
-        };
-        reader.onerror = () => resolve('');
-        reader.readAsDataURL(file);
-      });
-      if (base64) {
-        attachments.push({
-          id: `img-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
-          name: file.name,
-          kind: 'image',
-          base64,
-          mimeType: file.type || 'image/png',
-          size: file.size
+      const ext = '.' + (file.name.split('.').pop()?.toLowerCase() ?? '');
+      const imageExts = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
+      if (imageExts.has(ext)) {
+        if (file.size > 4 * 1024 * 1024) continue;
+        const base64 = await new Promise<string>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = reader.result as string;
+            resolve(dataUrl.split(',')[1] || '');
+          };
+          reader.onerror = () => resolve('');
+          reader.readAsDataURL(file);
         });
+        if (base64) {
+          attachments.push({
+            id: `img-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+            name: file.name,
+            kind: 'image',
+            base64,
+            mimeType: file.type || 'image/png',
+            size: file.size
+          });
+        }
+      } else {
+        // Text/code/doc files: read as text for the model. Large files are
+        // accepted (same 4MB gate as images) but the extracted text is capped
+        // at 200KB with a `truncated` flag — bounded payload, compact card.
+        if (file.size > 4 * 1024 * 1024) continue;
+        const text = await new Promise<string>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => resolve('');
+          reader.readAsText(file);
+        });
+        if (text) {
+          attachments.push({
+            id: `att-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+            name: file.name,
+            kind: 'text',
+            content: text.slice(0, 200 * 1024),
+            truncated: text.length > 200 * 1024,
+            size: file.size
+          });
+        }
       }
     }
     if (attachments.length > 0) {
@@ -198,9 +255,152 @@ export function Composer(props: ComposerProps) {
     e.target.value = '';
   }, [onAddAttachments]);
 
+  // Handle clipboard paste — detect pasted images AND files from Ctrl+V
+  const handlePaste = useCallback((e: ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imageFiles: File[] = [];
+    const otherFiles: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.startsWith('image/')) {
+        const file = items[i].getAsFile();
+        if (file) imageFiles.push(file);
+      }
+    }
+    // Also check for file data in clipboard (Windows Explorer copy)
+    const files = e.clipboardData?.files;
+    if (files) {
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        if (!f.type.startsWith('image/') && f.name) {
+          otherFiles.push(f);
+        }
+      }
+    }
+    if (imageFiles.length === 0 && otherFiles.length === 0) return;
+    e.preventDefault(); // prevent default paste for files/images
+    void (async () => {
+      const attachments: Attachment[] = [];
+      // Handle images
+      for (const file of imageFiles.slice(0, 5)) {
+        if (file.size > 4 * 1024 * 1024) continue;
+        const base64 = await new Promise<string>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = reader.result as string;
+            resolve(dataUrl.split(',')[1] || '');
+          };
+          reader.onerror = () => resolve('');
+          reader.readAsDataURL(file);
+        });
+        if (base64) {
+          attachments.push({
+            id: `img-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+            name: file.name || `pasted-image-${Date.now()}.png`,
+            kind: 'image',
+            base64,
+            mimeType: file.type || 'image/png',
+            size: file.size
+          });
+        }
+      }
+      // Handle other files (text/code/docs)
+      for (const file of otherFiles.slice(0, 5)) {
+        if (file.size > 4 * 1024 * 1024) continue;
+        const text = await new Promise<string>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => resolve('');
+          reader.readAsText(file);
+        });
+        if (text) {
+          attachments.push({
+            id: `att-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+            name: file.name || `pasted-file-${Date.now()}`,
+            kind: 'text',
+            content: text.slice(0, 200 * 1024),
+            truncated: text.length > 200 * 1024,
+            size: file.size
+          });
+        }
+      }
+      if (attachments.length > 0) {
+        onAddAttachments(attachments);
+      }
+    })();
+  }, [onAddAttachments]);
+
+  // Register paste event listener on the textarea
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.addEventListener('paste', handlePaste);
+    return () => el.removeEventListener('paste', handlePaste);
+  }, [handlePaste]);
+
+  // Handle drag & drop — support both images and text/code files
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length === 0) return;
+    e.preventDefault();
+    void (async () => {
+      const attachments: Attachment[] = [];
+      for (const file of files.slice(0, 8)) {
+        const ext = '.' + (file.name.split('.').pop()?.toLowerCase() ?? '');
+        const imageExts = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
+        const docExts = new Set(['.pdf', '.doc', '.docx', '.rtf', '.odt', '.xlsx', '.xls']);
+        if (imageExts.has(ext)) {
+          if (file.size > 4 * 1024 * 1024) continue;
+          const base64 = await new Promise<string>((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              const dataUrl = reader.result as string;
+              resolve(dataUrl.split(',')[1] || '');
+            };
+            reader.onerror = () => resolve('');
+            reader.readAsDataURL(file);
+          });
+          if (base64) {
+            attachments.push({
+              id: `img-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+              name: file.name,
+              kind: 'image',
+              base64,
+              mimeType: file.type || 'image/png',
+              size: file.size
+            });
+          }
+        } else if (docExts.has(ext) || file.size <= 4 * 1024 * 1024) {
+          // Text/code/doc files: read as text
+          const text = await new Promise<string>((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = () => resolve('');
+            reader.readAsText(file);
+          });
+          if (text) {
+            attachments.push({
+              id: `att-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+              name: file.name,
+              kind: 'text',
+              content: text.slice(0, 200 * 1024),
+              truncated: text.length > 200 * 1024,
+              size: file.size
+            });
+          }
+        }
+      }
+      if (attachments.length > 0) {
+        onAddAttachments(attachments);
+      }
+    })();
+  }, [onAddAttachments]);
+
   // Handle slash command selection — use a ref to avoid stale closure
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
+  const onGenerateImageRef = useRef(onGenerateImage);
+  onGenerateImageRef.current = onGenerateImage;
   const selectSlashCommand = useCallback((cmd: string) => {
     setSlashMenuOpen(false);
     setSlashMenuIndex(0);
@@ -218,8 +418,15 @@ export function Composer(props: ComposerProps) {
       className="composer"
       onSubmit={(event) => {
         event.preventDefault();
-        if (canSend) onSend();
+        if (!canSend) return;
+        if (generateImageMode && onGenerateImageRef.current) {
+          onGenerateImageRef.current(composer.trim(), attachments);
+        } else {
+          onSend();
+        }
       }}
+      onDrop={handleDrop}
+      onDragOver={(e) => { e.preventDefault(); }}
     >
       {(attachments.length > 0 || listening || speaking) && (
         <div className="composerChips">
@@ -315,7 +522,12 @@ export function Composer(props: ComposerProps) {
           }
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
-            if (canSend) onSend();
+            if (!canSend) return;
+            if (generateImageMode && onGenerateImageRef.current) {
+              onGenerateImageRef.current(composer.trim(), attachments);
+            } else if (canSend) {
+              onSend();
+            }
           }
         }}
         placeholder="Ask Latex anything..."
@@ -324,7 +536,7 @@ export function Composer(props: ComposerProps) {
       <div className="composerBar">
         <div className="composerBarLeft">
           <button type="button" className="iconButton" title="Attach files" onClick={onPickFiles}><Paperclip size={16} /></button>
-          <input ref={imageInputRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml" multiple style={{ position: 'absolute', width: 0, height: 0, opacity: 0, pointerEvents: 'none' }} onChange={handleImageFileChange} tabIndex={-1} />
+          <input ref={imageInputRef} type="file" accept="image/*,.txt,.md,.json,.js,.jsx,.ts,.tsx,.css,.html,.htm,.xml,.yaml,.yml,.csv,.tsv,.log,.py,.java,.cpp,.c,.h,.cs,.rs,.go,.toml,.env,.sh,.ps1,.bat,.sql,.pdf,.doc,.docx,.rtf,.odt,.xlsx,.xls" multiple style={{ position: 'absolute', width: 0, height: 0, opacity: 0, pointerEvents: 'none' }} onChange={handleImageFileChange} tabIndex={-1} />
           <button type="button" className="iconButton" title="Upload image" onClick={() => imageInputRef.current?.click()}><Image size={16} /></button>
           <div className="dropdownWrap">
             <button type="button" className="iconButton" title="Add context" onClick={() => onToggleContextMenu(!contextMenuOpen)}>
@@ -368,6 +580,41 @@ export function Composer(props: ComposerProps) {
               </div>
             )}
           </div>
+          {/* Image-generation mode — always available. When on, the prompt is
+              routed to a genuinely image-capable model on the same provider
+              (resolved in the main process); if the provider cannot return
+              generated image data, the activity panel says so honestly and the
+              model still answers in text. */}
+          <button
+            type="button"
+            className={`pillButton imagePill ${generateImageMode ? "imageModeOn" : ""}`}
+            title={generateImageMode
+              ? "Image generation mode on — this prompt will produce a picture"
+              : imageCapable
+                ? "Generate an image with this model"
+                : "Generate an image — Latex will use an image-capable model on this provider"}
+            onClick={() => setGenerateImageMode((v) => !v)}
+          >
+            <Image size={14} />
+            <span>{generateImageMode ? "Image generation" : "Generate image"}</span>
+          </button>
+
+          {/* Thinking control — only for models whose provider API genuinely
+              exposes reasoning. Default ON; an explicit OFF is remembered per
+              model and is never carried onto a model that cannot use it. */}
+          {appMode !== "chat" && thinkingSupported && (
+            <button
+              type="button"
+              className={`pillButton thinkingPill ${thinkingOn ? "thinkingOn" : ""}`}
+              title={thinkingOn
+                ? "Provider thinking is on — click to turn it off for this model"
+                : "Provider thinking is off for this model — click to turn it on"}
+              onClick={() => onToggleThinking?.(!thinkingOn)}
+            >
+              <Brain size={14} />
+              <span>{thinkingOn ? "Thinking" : "Thinking off"}</span>
+            </button>
+          )}
         </div>
 
         <div className="composerBarRight">
@@ -384,6 +631,7 @@ export function Composer(props: ComposerProps) {
             onSelectAutoModel={onSelectAutoModel}
             activeProvider={activeProvider}
             providerHealth={providerHealth}
+            onStartOllama={onStartOllama}
           />
           <button
             type="button"
@@ -399,8 +647,13 @@ export function Composer(props: ComposerProps) {
               <Square size={14} fill="currentColor" />
             </button>
           ) : (
-            <button type="submit" className="sendButton" disabled={!canSend} title="Send">
-              <Send size={16} />
+            <button
+              type="submit"
+              className={`sendButton ${generateImageMode ? "imageMode" : ""}`}
+              disabled={!canSend}
+              title={generateImageMode ? "Generate image" : "Send"}
+            >
+              {generateImageMode ? <Image size={16} /> : <Send size={16} />}
             </button>
           )}
         </div>
@@ -428,6 +681,15 @@ function isAutomationModel(model: GeminiModel): boolean {
   // Claude Haiku 4.5 — fast, supports coding/bash/computer-use
   if (/claude.*haiku.*(4\.5|4-5|latest)/i.test(lower) || /claude.*haiku.*(4\.5|4-5)/i.test(id)) return true;
 
+  // ── Ollama local models — tool-capable models qualify for the agent workflow ──
+  if (provider === "ollama" && model.supportsTools) return true;
+
+  // ── NVIDIA Nemotron models ──
+  // Nemotron models are ordinary chat/tool-calling models (70B/49B/340B and
+  // the newer Nemotron-3 families) and were previously hidden from the picker
+  // entirely. Keep them selectable whenever the provider reports tool support.
+  if (/nemotron|nvidia/i.test(lower + " " + id) && model.supportsTools) return true;
+
   // ── Other automation-suitable models ──
   // Qwen 3.7 Max / Qwen 3 Coder
   if (/qwen.*3\.7.*max|qwen.*37.*max|qwen.*3.*coder/i.test(lower)) return true;
@@ -441,10 +703,6 @@ function isAutomationModel(model: GeminiModel): boolean {
   // Gemma 4 models
   if (/gemma.?4.*31b|gemma.?4.*26ba/i.test(lower)) return true;
   if (/gemma.*4.*31b|gemma.*4.*26ba/i.test(id)) return true;
-  // Nemotron 3.5 Lightning Free
-  if (/nemotron.*3\.5.*lightning/i.test(lower)) return true;
-  if (/nemotron.*3\.5.*lightning/i.test(id)) return true;
-
   return false;
 }
 
@@ -482,6 +740,12 @@ function isRecommendedModel(model: GeminiModel): boolean {
     if (/gemini.*2\.5.*flash|gemini.*2\.5.*pro/i.test(id)) return true;
   }
 
+  // ── Ollama models: local tool-capable coding models make the cut ──
+  if (model.provider === "ollama") {
+    if (model.supportsTools && /coder|code|instruct|chat|qwen|gemma|llama|deepseek/i.test(id)) return true;
+    return false;
+  }
+
   // ── Other strong models from any connected provider ──
   // Gemma 4 models
   if (/gemma.*4/i.test(lower) || /gemma.*4/i.test(id)) return true;
@@ -501,6 +765,9 @@ function isWeakModel(model: GeminiModel): boolean {
   const name = model.name.toLowerCase();
   const desc = `${model.description ?? ""} ${model.displayName ?? ""}`.toLowerCase();
   const combined = `${name} ${desc}`;
+  // NVIDIA/Nemotron models are explicitly supported — never hide them for size
+  // or for looking like a "nano"/small variant name.
+  if (/nemotron|nvidia/i.test(combined)) return false;
   // Extract parameter count from name (e.g. "7b", "14b", "32b", "70b")
   const paramMatch = combined.match(/(\d+\.?\d*)b(?:\s|$|[^a-z])/);
   if (paramMatch) {
@@ -545,7 +812,8 @@ function ModelSelector({
   onSelectModel,
   onSelectAutoModel,
   activeProvider,
-  providerHealth
+  providerHealth,
+  onStartOllama
 }: {
   modelLabel: string;
   models: GeminiModel[];
@@ -562,14 +830,23 @@ function ModelSelector({
     provider: string; label: string; configured: boolean;
     status: "ok" | "error" | "no_key"; modelCount: number; error?: string; httpStatus?: number;
   }>;
+  onStartOllama?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  // ── Single-select model filter ──────────────────────────────────────
+  // ONE active filter value. "Thinking" is a FILTER over the model list (like
+  // a provider tab), never a mode and never composable with a provider: the
+  // chips are mutually exclusive, so clicking a provider always leaves the
+  // Thinking filter. This is the single source of truth for the selection.
   const [scope, setScope] = useState<string>("all");
   const [lastRefreshed, setLastRefreshed] = useState<string | null>(null);
 
   useEffect(() => {
-    setScope((current) => (current === "all" || !activeProvider ? current : `provider:${activeProvider}`));
+    // Keep the provider tab in sync with the active model's provider — but
+    // never hijack a non-provider filter (All / Recommended / Automation /
+    // Thinking): those are their own single selection.
+    setScope((current) => (current === "all" || current === "thinking" || current === "recommended" || current === "automation" || !activeProvider ? current : `provider:${activeProvider}`));
   }, [activeProvider]);
 
   // Provider health lookup helper
@@ -612,6 +889,18 @@ function ModelSelector({
     });
     if (scope === "all") return strong;
     if (scope === "automation") return strong.filter((model) => isAutomationModel(model));
+    // THINKING scope: only models whose provider API genuinely exposes reasoning
+    // to Latex (see shared/modelCapabilities). Search inside this scope stays
+    // inside it, so "Thinking" + a query never reveals non-thinking models.
+    // A provider may additionally narrow it ("Thinking + OpenRouter"), and we use
+    // allStrong here so provider-specific reasoning models are not hidden by the
+    // "All" scope's Claude-on-OpenRouter de-duplication.
+    if (scope === "thinking") {
+      // ONLY the allowed providers, and only models whose exact provider+model
+      // genuinely exposes reasoning. OpenRouter is never shown here even
+      // though its models stay available in All Models.
+      return allStrong.filter((model) => modelEligibleForThinkingFilter(model));
+    }
     if (scope === "recommended") {
       const rec = strong.filter((model) => isRecommendedModel(model));
       // Custom sort order for Recommended models
@@ -695,13 +984,25 @@ function ModelSelector({
     setQuery("");
   };
 
+  const handleScopeClick = (key: string) => {
+    // SINGLE-SELECT. Every chip (All / Recommended / Automation / Thinking /
+    // each provider) is an exclusive choice: clicking one replaces the active
+    // filter outright, so two chips can never appear selected together. The
+    // Thinking chip selects the reasoning-capable model list — it does NOT
+    // enable reasoning for a task (that is Main's per-model Thinking control).
+    if (key === scope) return;
+    setScope(key);
+  };
+
   const handleRefresh = async () => {
     await onRetryModels();
     const now = new Date();
     setLastRefreshed(now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
   };
 
-  const scopeLabel = scope === "all" ? "All providers" : scope === "recommended" ? "Recommended" : scope === "automation" ? "Automation" : (PROVIDER_LABELS[scope.replace("provider:", "") as ModelProvider] ?? scope);
+  const scopeLabel = scope === "all" ? "All providers" : scope === "recommended" ? "Recommended" : scope === "automation" ? "Automation"
+    : scope === "thinking" ? "Thinking"
+    : (PROVIDER_LABELS[scope.replace("provider:", "") as ModelProvider] ?? scope);
   const totalCount = filtered.length;
 
   return (
@@ -731,21 +1032,26 @@ function ModelSelector({
               { key: "all", label: "All", providerName: undefined },
               { key: "recommended", label: "Recommended", providerName: undefined },
               { key: "automation", label: "Automation", providerName: undefined },
+              { key: "thinking", label: "Thinking", providerName: undefined },
               { key: "provider:gemini", label: "Gemini", providerName: "gemini" },
               { key: "provider:groq", label: "Groq", providerName: "groq" },
               { key: "provider:openrouter", label: "OpenRouter", providerName: "openrouter" },
               { key: "provider:minimax", label: "MiniMax", providerName: "minimax" },
-              { key: "provider:puter", label: "Puter", providerName: "puter" }
+              { key: "provider:puter", label: "Puter", providerName: "puter" },
+              { key: "provider:ollama", label: "Ollama", providerName: "ollama" },
+              { key: "provider:omniroute", label: "OmniRoute", providerName: "omniroute" }
             ]).map((chip) => {
               const health = chip.providerName ? getProviderHealth(chip.providerName) : undefined;
               const healthIcon = health ? (health.status === "ok" ? "\u2713" : health.status === "error" ? "\u2717" : "\u2014") : "";
               const healthClass = health ? (health.status === "ok" ? "healthOk" : health.status === "error" ? "healthErr" : "healthUnknown") : "";
+              // Exactly one chip is active: the active filter itself.
+              const chipActive = scope === chip.key;
               return (
                 <button
                   key={chip.key}
                   type="button"
-                  className={`modelScopeChip ${scope === chip.key ? "active" : ""}`}
-                  onClick={() => setScope(chip.key)}
+                  className={`modelScopeChip ${chipActive ? "active" : ""}`}
+                  onClick={() => handleScopeClick(chip.key)}
                   title={health ? `${chip.label}: ${health.status === "ok" ? `${health.modelCount} models` : health.error ?? "Not configured"}` : chip.label}
                 >
                   {chip.label}
@@ -850,6 +1156,11 @@ function ModelSelector({
             <PuterCategories models={filtered} selectedModel={selectedModel} autoModel={autoModel} onSelect={select} providerHealth={providerHealth} />
           )}
 
+          {/* Ollama scope: LOCAL and CLOUD sections */}
+          {modelsState === "ready" && scope === "provider:ollama" && (
+            <OllamaCategories models={filtered} selectedModel={selectedModel} autoModel={autoModel} onSelect={select} providerHealth={providerHealth} onStartOllama={onStartOllama} />
+          )}
+
           {/* OpenRouter scope: GPT → Qwen → DeepSeek → Claude → Other */}
           {modelsState === "ready" && scope === "provider:openrouter" && (
             <>
@@ -925,8 +1236,28 @@ function ModelSelector({
             </>
           )}
 
+          {/* OmniRoute scope: show models from the local OmniRoute gateway */}
+          {modelsState === "ready" && scope === "provider:omniroute" && (
+            <div className="modelCategory">
+              <div className="modelCategoryLabel">
+                <span className="modelCategoryDot other" />
+                OmniRoute Models
+                <span className="modelCategoryCount">{filtered.length}</span>
+              </div>
+              <div className="modelGroup">
+                {filtered.map((model) => renderModelRow(model, selectedModel, autoModel, select, providerHealth))}
+              </div>
+            </div>
+          )}
+
+          {/* Thinking scope: verified reasoning models only, sections in the
+              fixed order PUTER → OLLAMA → OMNIROUTE → MINIMAX → GEMINI. */}
+          {modelsState === "ready" && scope === "thinking" && (
+            <ThinkingCategories models={filtered} selectedModel={selectedModel} autoModel={autoModel} onSelect={select} providerHealth={providerHealth} />
+          )}
+
           {/* Provider-specific or Recommended scopes (non-OpenRouter) */}
-          {modelsState === "ready" && scope !== "all" && scope !== "automation" && scope !== "provider:puter" && scope !== "provider:openrouter" && otherModels.length > 0 && (
+          {modelsState === "ready" && scope !== "all" && scope !== "automation" && scope !== "thinking" && scope !== "provider:puter" && scope !== "provider:ollama" && scope !== "provider:openrouter" && scope !== "provider:omniroute" && otherModels.length > 0 && (
             <div className="modelCategory">
               <div className="modelCategoryLabel">
                 <span className="modelCategoryDot other" />
@@ -948,6 +1279,62 @@ function ModelSelector({
 }
 
 /** Curated Puter model categories */
+/** Ollama scope: local models and (signed-in) Ollama Cloud models, clearly separated. */
+function OllamaCategories({ models, selectedModel, autoModel, onSelect, providerHealth, onStartOllama }: {
+  models: GeminiModel[];
+  selectedModel: string | undefined;
+  autoModel: boolean;
+  onSelect: (name: string) => void;
+  providerHealth?: Array<{ provider: string; status: "ok" | "error" | "no_key"; error?: string; modelCount: number }>;
+  onStartOllama?: () => void;
+}) {
+  const local = models.filter((m) => !isCloudTag(m.name));
+  const cloud = models.filter((m) => isCloudTag(m.name));
+  const sections = [
+    { label: "LOCAL MODELS", icon: "\ud83d\udcbb", models: local },
+    { label: "OLLAMA CLOUD", icon: "\u2601\ufe0f", models: cloud }
+  ];
+  return (
+    <>
+      {/* Start Ollama Button */}
+      <div className="modelCategory ollamaStartCategory">
+        <button
+          type="button"
+          className="ollamaStartBtn"
+          onClick={() => onStartOllama?.()}
+        >
+          <span className="ollamaStartIcon">▶</span>
+          <span className="ollamaStartText">Start Ollama</span>
+        </button>
+      </div>
+
+      {sections.map((section) => section.models.length > 0 && (
+        <div key={section.label} className="modelCategory">
+          <div className="modelCategoryLabel">
+            <span className="modelCategoryDot other" />
+            {section.icon} {section.label}
+            <span className="modelCategoryCount">{section.models.length}</span>
+          </div>
+          <div className="modelGroup">
+            {section.models.map((model) => renderModelRow(model, selectedModel, autoModel, onSelect, providerHealth))}
+          </div>
+        </div>
+      ))}
+      {models.length === 0 && (
+        <div className="modelMenuState">No Ollama models found. Click "Start Ollama" above to start the Ollama server, then pull a model (e.g. <code>ollama pull qwen2.5-coder</code>).</div>
+      )}
+      {cloud.length === 0 && local.length > 0 && (
+        <div className="modelMenuState">Ollama Cloud requires signing in to your Ollama account in the Ollama app — cloud models will appear here after you sign in.</div>
+      )}
+    </>
+  );
+}
+
+/** True when the model tag refers to an Ollama Cloud model. */
+function isCloudTag(name: string): boolean {
+  return /-cloud|:cloud|cloud/i.test(name);
+}
+
 function PuterCategories({ models, selectedModel, autoModel, onSelect, providerHealth }: {
   models: GeminiModel[];
   selectedModel: string | undefined;
@@ -988,6 +1375,72 @@ function PuterCategories({ models, selectedModel, autoModel, onSelect, providerH
   );
 }
 
+/** Display labels for the Thinking filter's fixed provider sections. */
+const THINKING_PROVIDER_LABELS: Partial<Record<ModelProvider, string>> = {
+  puter: "Puter",
+  ollama: "Ollama",
+  omniroute: "OmniRoute",
+  minimax: "MiniMax",
+  gemini: "Google Gemini"
+};
+
+/**
+ * Thinking filter: verified reasoning models only, grouped into fixed provider
+ * sections (Puter → Ollama → OmniRoute → MiniMax → Gemini). Never alphabetical,
+ * never OpenRouter. A section with no verified models is omitted entirely.
+ */
+function ThinkingCategories({ models, selectedModel, autoModel, onSelect, providerHealth }: {
+  models: GeminiModel[];
+  selectedModel: string | undefined;
+  autoModel: boolean;
+  onSelect: (name: string) => void;
+  providerHealth?: Array<{ provider: string; status: "ok" | "error" | "no_key"; error?: string; modelCount: number }>;
+}) {
+  const groups = useMemo(() => {
+    const map = new Map<ModelProvider, GeminiModel[]>();
+    for (const model of models) {
+      const provider = (model.provider ?? providerOfModel(model.name)) as ModelProvider;
+      if (!THINKING_FILTER_ORDER.includes(provider)) continue;
+      const list = map.get(provider) ?? [];
+      list.push(model);
+      map.set(provider, list);
+    }
+    // Strongest / most capable verified thinking model first.
+    for (const list of map.values()) list.sort(compareThinkingModels);
+    return map;
+  }, [models]);
+
+  const sections = THINKING_FILTER_ORDER
+    .map((provider) => ({ provider, list: groups.get(provider) ?? [] }))
+    .filter((section) => section.list.length > 0);
+
+  if (sections.length === 0) {
+    return (
+      <div className="modelMenuState">
+        No verified thinking models right now. Thinking lists only models whose
+        provider actually exposes reasoning (Puter, Ollama, OmniRoute, MiniMax, Gemini).
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {sections.map((section) => (
+        <div key={section.provider} className="modelCategory">
+          <div className="modelCategoryLabel">
+            <span className="modelCategoryDot other" />
+            {THINKING_PROVIDER_LABELS[section.provider] ?? section.provider}
+            <span className="modelCategoryCount">{section.list.length} models</span>
+          </div>
+          <div className="modelGroup">
+            {section.list.map((model) => renderModelRow(model, selectedModel, autoModel, onSelect, providerHealth))}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
 function groupByProvider(models: GeminiModel[]): Array<[string, GeminiModel[]]> {
   const byProvider = new Map<string, GeminiModel[]>();
   for (const model of models) {
@@ -1022,7 +1475,10 @@ function renderModelRow(model: GeminiModel, selectedModel: string | undefined, a
         <span className="modelRowName">
           {model.displayName ?? modelShortName(model.name)}
           {model.isFree && <span className="modelFreeTag">free</span>}
-          <span className="modelProviderBadge" title={`Served by ${PROVIDER_LABELS[provider] ?? provider}`}>{provider === "puter" ? "Puter" : provider === "openrouter" ? "OR" : provider === "gemini" ? "Gem" : provider === "groq" ? "Groq" : provider === "minimax" ? "MM" : provider}</span>
+          <span className="modelProviderBadge" title={`Served by ${PROVIDER_LABELS[provider] ?? provider}`}>{provider === "puter" ? "Puter" : provider === "openrouter" ? "OR" : provider === "gemini" ? "Gem" : provider === "groq" ? "Groq" : provider === "minimax" ? "MM" : provider === "ollama" ? "Ollama" : provider}</span>
+          {provider === "ollama" && (
+            <span className={`modelLocalTag ${isCloudTag(model.name) ? "cloud" : ""}`}>{isCloudTag(model.name) ? "CLOUD" : "LOCAL"}</span>
+          )}
         </span>
         <span className="modelRowId">
           {healthDot && <span className="modelRowHealth" style={{ color: healthColor }} title={healthTitle}>{healthDot}</span>}
@@ -1033,7 +1489,25 @@ function renderModelRow(model: GeminiModel, selectedModel: string | undefined, a
       </span>
       {model.supportsTools && <span className="modelTag toolTag" title="Supports tool calling">tools</span>}
       {model.supportsVision && <span className="modelTag" title="Supports vision">vision</span>}
-      {model.supportsReasoning && <span className="modelTag" title="Reasoning model">reason</span>}
+      {/* "reason" was a name-based guess; this tag states whether the provider
+          actually EXPOSES thinking to Latex, with the reason in its tooltip. */}
+      {(() => {
+        const thinking = thinkingCapabilityOfModel(model);
+        if (thinking.supportsThinking) {
+          return <span className="modelTag thinkingTag" title={thinking.reason}>{thinkingBadgeLabel(thinking)?.toLowerCase() ?? "thinking"}</span>;
+        }
+        return model.supportsReasoning
+          ? <span className="modelTag" title="Reasoning-capable model, but this provider does not expose its thinking to Latex">reason</span>
+          : null;
+      })()}
+      {/* Image generation is a CAPABILITY, not a name guess: this badge says
+          whether the provider API really returns generated image data. */}
+      {(() => {
+        const image = imageGenerationCapabilityOfModel(model);
+        return image.supportsImageGeneration
+          ? <span className="modelTag imageTag" title={image.reason}>{imageGenerationBadgeLabel(image)?.toLowerCase() ?? "image"}</span>
+          : null;
+      })()}
     </button>
   );
 }

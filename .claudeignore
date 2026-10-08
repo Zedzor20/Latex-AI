@@ -1,0 +1,35 @@
+# Deep Version Control History
+.git/
+.github/
+.gitlab/
+.gitattributes
+
+# Environment Variables & Secrets
+.env
+.env.*
+*.pem
+*.key
+*.secret
+
+# Heavy OS / System Artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.user
+
+# Package Managers (Massive Token Killers)
+node_modules/
+bower_components/
+
+# Build & Dist Outputs
+dist/
+build/
+out/
+.next/
+.nuxt/
+.docusaurus/
+.turbo/
+.cache/
+*.tsbuildinfo

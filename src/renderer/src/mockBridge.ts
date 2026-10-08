@@ -1,4 +1,4 @@
-import type { AgentEvent, ApprovalRequest, Attachment, Conversation, FileTreeNode, GeminiModel, LatexSettings, ModelProvider, PendingChange, Workspace } from "../../shared/types";
+import type { AgentEvent, ApprovalRequest, Attachment, ChatMessage, Conversation, FileTreeNode, GeminiModel, LatexSettings, ModelProvider, PendingChange, Workspace } from "../../shared/types";
 
 /**
  * Dev-only bridge mock. When the renderer is served by Vite in a plain
@@ -210,6 +210,17 @@ export function installMockBridgeIfNeeded() {
       },
       run: async (conversation: Conversation, _workspace?: Workspace, attachments: Attachment[] = []): Promise<Conversation> => {
         return finishMockRun(conversation, "agent", attachments);
+      },
+      generateImage: async (conversation: Conversation, _workspace?: Workspace, _attachments: Attachment[] = []): Promise<Conversation> => {
+        // The browser preview has no provider: return the conversation with a
+        // plain notice so the UI path is exercised without faking an image.
+        const message: ChatMessage = {
+          id: `msg_${Date.now()}`,
+          role: "assistant",
+          content: "Image generation requires the desktop app with a configured image-capable model.",
+          createdAt: Date.now()
+        };
+        return { ...conversation, messages: [...conversation.messages, message], updatedAt: Date.now() };
       },
       stop: async () => {
         for (const [requestId, resolve] of pendingResolvers) {

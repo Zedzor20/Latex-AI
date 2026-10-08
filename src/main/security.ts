@@ -94,3 +94,27 @@ export function redactSecret(value: string): string {
   if (value.length < 10) return "********";
   return `${value.slice(0, 4)}...${value.slice(-4)}`;
 }
+
+/**
+ * Redact credentials from text that is about to be shown in the ACTIVITY UI
+ * (a command about to run, or captured stdout/stderr).
+ *
+ * Commands and their output are user-visible, and a shell line such as
+ * `set OPENROUTER_API_KEY=sk-live-…` or `curl -H "Authorization: Bearer …"`
+ * must never put a real secret on screen. Only the secret VALUE is masked:
+ * the surrounding command stays readable so the activity remains truthful.
+ */
+export function redactActivityText(text: string | undefined): string | undefined {
+  if (typeof text !== "string" || text.length === 0) return text;
+  let out = text;
+  // Key/name = value (set, export, --env, JSON, .env lines, …)
+  out = out.replace(
+    /((?:api[_-]?key|apikey|secret|token|password|passwd|pwd|access[_-]?key|auth[_-]?token|bearer)\s*[:=]\s*)(["'`]?)([^\s"'`,;]+)\2/gi,
+    (_match, prefix: string, quote: string) => `${prefix}${quote}********${quote}`
+  );
+  // Authorization: Bearer <token>
+  out = out.replace(/(authorization\s*:\s*bearer\s+)([^\s"']+)/gi, (_m, prefix: string) => `${prefix}********`);
+  // Vendor key shapes: sk-…, sk_live_…, gsk_…, xai-…, AIza…
+  out = out.replace(/\b(sk-[\w-]{8,}|sk_live_[\w]{8,}|gsk_[\w]{8,}|xai-[\w-]{8,}|AIza[\w-]{20,})\b/g, "********");
+  return out;
+}

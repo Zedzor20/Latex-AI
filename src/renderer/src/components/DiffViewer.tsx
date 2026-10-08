@@ -1,4 +1,4 @@
-import { Check, Clipboard, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Clipboard, X } from "lucide-react";
 import { useState } from "react";
 import type { PendingChange } from "../../../shared/types";
 import { diffStats } from "../lib/format";
@@ -8,6 +8,13 @@ import { Modal } from "./ui";
 
 interface DiffViewerProps {
   changes: PendingChange[];
+  /**
+   * A RESTORED review — the records came off a finished message, not off the
+   * live turn. It renders the same real diffs but offers no Accept / Reject /
+   * Undo: that work is already committed to disk, and "undo" would rewrite a
+   * file whose content has moved on since.
+   */
+  readOnly?: boolean;
   onAccept: (change: PendingChange) => void;
   onReject: (id: string) => void;
   onUndo: (change: PendingChange) => void;
@@ -15,6 +22,14 @@ interface DiffViewerProps {
   onRejectAll: () => void;
   onClose: () => void;
 }
+
+/** Net effect of the turn on a file (one entry per path). */
+const KIND_LABELS: Record<"created" | "modified" | "deleted" | "renamed", string> = {
+  created: "Created",
+  modified: "Modified",
+  deleted: "Deleted",
+  renamed: "Renamed"
+};
 
 function CopyDiffButton({ diff }: { diff: string }) {
   const [copied, setCopied] = useState(false);
@@ -32,9 +47,12 @@ function CopyDiffButton({ diff }: { diff: string }) {
   );
 }
 
-export function DiffViewer({ changes, onAccept, onReject, onUndo, onAcceptAll, onRejectAll, onClose }: DiffViewerProps) {
+export function DiffViewer({ changes, readOnly = false, onAccept, onReject, onUndo, onAcceptAll, onRejectAll, onClose }: DiffViewerProps) {
   const pending = changes.filter((c) => c.status === "pending");
   const accepted = changes.filter((c) => c.status === "accepted");
+  // Every file's diff is expanded by default; the user can collapse any of
+  // them to scan a long review. Tracked by id so it survives re-renders.
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const total = changes.reduce(
     (acc, change) => {
       const stats = diffStats(change.diff);
@@ -46,7 +64,7 @@ export function DiffViewer({ changes, onAccept, onReject, onUndo, onAcceptAll, o
   );
 
   return (
-    <Modal onClose={onClose} width={820}>
+    <Modal onClose={onClose} width={1160}>
       <div className="diffViewer">
         <div className="diffHeader">
           <div className="diffTitle">Review changes</div>
@@ -54,12 +72,12 @@ export function DiffViewer({ changes, onAccept, onReject, onUndo, onAcceptAll, o
             {changes.length} file{changes.length === 1 ? "" : "s"} changed · <span className="statAdded">+{total.added}</span> <span className="statRemoved">-{total.removed}</span>
           </div>
           <div className="diffHeaderActions">
-            {pending.length > 0 && (
+            {!readOnly && pending.length > 0 && (
               <button className="btn sm primary" onClick={onAcceptAll}>
                 <Check size={14} /> Accept All
               </button>
             )}
-            {pending.length > 0 && (
+            {!readOnly && pending.length > 0 && (
               <button className="btn sm" onClick={onRejectAll}>
                 <X size={14} /> Reject All
               </button>
@@ -71,17 +89,36 @@ export function DiffViewer({ changes, onAccept, onReject, onUndo, onAcceptAll, o
           {changes.map((change) => {
             const stats = diffStats(change.diff);
             const isPending = change.status === "pending";
+            const kind = change.kind ?? (change.existed === false ? "created" : "modified");
+            const isOpen = !collapsed.has(change.id);
             return (
               <section key={change.id} className="diffCard">
                 <div className="diffCardHead">
-                  <span className="diffFilePath">{change.filePath}</span>
+                  <button
+                    className="iconButton"
+                    title={isOpen ? "Collapse diff" : "Expand diff"}
+                    onClick={() => setCollapsed((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(change.id)) next.delete(change.id);
+                      else next.add(change.id);
+                      return next;
+                    })}
+                  >
+                    {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  </button>
+                  <span className={`changeKind ${kind}`}>{KIND_LABELS[kind]}</span>
+                  <span className="diffFilePath" title={change.filePath}>
+                    {change.renamedFrom ? `${change.renamedFrom} → ${change.filePath}` : change.filePath}
+                  </span>
+                  {change.description && <span className="changeDesc">{change.description}</span>}
+                  {(change.operations ?? 1) > 1 && <span className="changeOpsCount">×{change.operations}</span>}
                   <span className="changesStats">
                     <span className="statAdded">+{stats.added}</span>
                     <span className="statRemoved">-{stats.removed}</span>
                   </span>
                   <span className={`changeStatus ${change.status}`}>{change.status}</span>
                   <CopyDiffButton diff={change.diff} />
-                  {isPending ? (
+                  {!readOnly && (isPending ? (
                     <>
                       <button className="btn sm" onClick={() => onAccept(change)}><Check size={13} /> Accept</button>
                       <button className="btn sm" onClick={() => onReject(change.id)}><X size={13} /> Reject</button>
@@ -90,15 +127,19 @@ export function DiffViewer({ changes, onAccept, onReject, onUndo, onAcceptAll, o
                     change.status === "accepted" && (
                       <button className="btn sm" onClick={() => onUndo(change)}>Undo</button>
                     )
-                  )}
+                  ))}
                 </div>
-                <DiffLines diff={change.diff} />
+                {isOpen && <DiffLines diff={change.diff} />}
               </section>
             );
           })}
         </div>
         <div className="diffFooter">
-          <span>{accepted.length} accepted · {changes.filter((c) => c.status === "rejected").length} rejected</span>
+          <span>
+            {readOnly
+              ? "Restored from this turn's records — the changes are already on disk."
+              : <>{accepted.length} accepted · {changes.filter((c) => c.status === "rejected").length} rejected</>}
+          </span>
           <button className="btn" onClick={onClose}>Close</button>
         </div>
       </div>

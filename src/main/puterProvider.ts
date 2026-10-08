@@ -1,6 +1,8 @@
 import type { GeminiModel } from "../shared/types.js";
+import { thinkingCapability } from "../shared/modelCapabilities.js";
 import { classifyHttpStatus } from "../shared/types.js";
 import { safeExtractMessage } from "../shared/safeMessage.js";
+import { attachmentBlock, filesOf, imageBytes, imageDataUrl, imagesOf, logVision } from "../shared/vision.js";
 import type { AIProvider, GeminiChunk, GeminiGenerateInput } from "./geminiProvider.js";
 
 /**
@@ -222,7 +224,10 @@ export class PuterProvider implements AIProvider {
         const nameAndDesc = `${id} ${displayName} ${description} ${capsLower}`.toLowerCase();
 
         const supportsVision = /vision|multimodal|image/.test(nameAndDesc);
-        const supportsReasoning = /reason|think|thinking/.test(nameAndDesc);
+        // Thinking follows the ACTUAL upstream model behind Puter, detected by
+        // the shared capability layer (real provider metadata `capabilities`
+        // counts; a name that merely says "thinking" does not).
+        const supportsReasoning = thinkingCapability("puter", id, { capabilities: caps }).supportsThinking;
         const excluded = /embedding|rerank|moderation|whisper|tts|audio|speech|dall.e|flux|stable|transcri/.test(nameAndDesc);
         const supportsTools = !excluded && /chat|code|coder|assistant|instruct|agent/.test(nameAndDesc);
 
@@ -264,6 +269,74 @@ export class PuterProvider implements AIProvider {
       role: message.role === "model" ? "assistant" : message.role,
       content: message.parts.map((part) => part.text).join("")
     }));
+
+    // ── Vision pipeline ─────────────────────────────────────────────────
+    // Replay per-message images from persisted meta, then fresh attachments
+    // on the last user message (deduped). Images are always normalized.
+    let visionImages = 0;
+    let visionBytes = 0;
+    input.messages.forEach((source, index) => {
+      const imgs = imagesOf(source.attachments);
+      const fileParts = filesOf(source.attachments);
+      if (imgs.length === 0 && fileParts.length === 0) return;
+      const contentParts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+      const existing = source.parts.map((part) => part.text).join("");
+      if (existing.trim()) contentParts.push({ type: "text", text: existing });
+      // Replay persisted FILE content — visible messages stay compact (file
+      // text lives only in meta), so the request layer re-injects it here.
+      if (fileParts.length > 0) contentParts.push({ type: "text", text: fileParts.map(attachmentBlock).join("") });
+      for (const att of imgs) {
+        const url = imageDataUrl(att);
+        if (!url) {
+          throw classifyHttpStatus("puter", input.model, 400, `Image "${att.name ?? "attachment"}" could not be prepared for the model (invalid image data). The image was NOT sent as text instead.`);
+        }
+        contentParts.push({ type: "image_url", image_url: { url } });
+        visionImages += 1;
+        visionBytes += imageBytes([att]);
+      }
+      (messages[index] as Record<string, unknown>).content = contentParts;
+    });
+
+    // Handle image attachments — convert to OpenAI-compatible vision format
+    const attachments = input.attachments?.filter((a) => a.kind === "image" || a.kind === "text");
+    const lastIndex = messages.length - 1;
+    const lastSource = input.messages[lastIndex];
+    const lastAlreadyHasImages = imagesOf(lastSource?.attachments).length > 0;
+    // File attachments already replayed from the last message's meta — never send twice.
+    const carriedFileNames = new Set(filesOf(lastSource?.attachments).map((a) => a.name));
+    if (attachments?.length && !lastAlreadyHasImages) {
+      const last = messages[lastIndex];
+      if (last && last.role === "user") {
+        const hasImages = attachments.some((a) => a.kind === "image" && a.base64);
+        if (hasImages) {
+          const contentParts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+          if (typeof last.content === "string" && last.content.trim()) {
+            contentParts.push({ type: "text", text: last.content });
+          }
+          for (const att of attachments) {
+            if (att.kind === "image") {
+              const url = imageDataUrl(att);
+              if (!url) {
+                throw classifyHttpStatus("puter", input.model, 400, `Image "${att.name ?? "attachment"}" could not be prepared for the model (invalid image data). The image was NOT sent as text instead.`);
+              }
+              contentParts.push({ type: "image_url", image_url: { url } });
+              visionImages += 1;
+              visionBytes += imageBytes([att]);
+            } else if (att.content && !carriedFileNames.has(att.name)) {
+              contentParts.push({ type: "text", text: `\n[Attachment: ${att.name}]\n${att.content}` });
+            }
+          }
+          (last as Record<string, unknown>).content = contentParts;
+        } else {
+          for (const att of attachments) {
+            if (att.content && !carriedFileNames.has(att.name)) {
+              last.content += `\n\n[Attachment: ${att.name}]\n${att.content}`;
+            }
+          }
+        }
+      }
+    }
+    logVision("puter", visionImages, visionBytes, messages.length);
 
     const args: Record<string, unknown> = {
       messages: [{ role: "system", content: input.system }, ...messages],
@@ -385,8 +458,10 @@ export class PuterProvider implements AIProvider {
               }
 
               if (chunkType === "reasoning" && typeof parsed.text === "string" && parsed.text) {
-                yieldedAny = true;
-                yield { type: "text", text: parsed.text };
+                // Reasoning is delivered the same way normal text is, including
+                // the double-encoded JSON-string case — unwrap it here too, or
+                // the Thinking box renders literal \n and \" sequences.
+                yield { type: "reasoning", text: tryUnwrapJsonString(parsed.text) };
                 continue;
               }
 

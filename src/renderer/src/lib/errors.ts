@@ -15,7 +15,9 @@ const PROVIDER_LABELS: Record<ModelProvider, string> = {
   openrouter: "OpenRouter",
   minimax: "MiniMax",
   groq: "Groq",
-  puter: "Puter"
+  puter: "Puter",
+  ollama: "Ollama",
+  omniroute: "OmniRoute"
 };
 
 /** Detect the provider from the raw error text when the caller doesn't know it. */
@@ -25,6 +27,7 @@ function providerFromMessage(raw: string): ModelProvider | undefined {
   if (lower.includes("minimax")) return "minimax";
   if (lower.includes("groq")) return "groq";
   if (lower.includes("gemini")) return "gemini";
+  if (lower.includes("ollama")) return "ollama";
   return undefined;
 }
 
@@ -183,6 +186,41 @@ export function translateError(err: unknown, provider?: ModelProvider): ErrorInf
   if (cleanDetail) richDetailParts.push(`Reason: ${cleanDetail}`);
   const richDetail = richDetailParts.length > 0 ? richDetailParts.join("\n") : cleanDetail;
 
+  // Timeout / aborted requests: use the error's OWN provider+model metadata
+  // so the card names the model that actually stalled — never whatever model
+  // happens to be selected now (the old "Ollama qwen…" misattribution bug).
+  if (errObj?.errorType === "timeout" || /did not respond within|timed out/i.test(raw)) {
+    const m = model ? ` (${modelShortName(model)})` : "";
+    // Task-level 30-minute maximum (shared request policy) — say so plainly
+    // instead of implying the model was merely slow (Part S).
+    if (/30-minute maximum runtime/i.test(raw)) {
+      return {
+        message: "Generation reached the 30-minute maximum runtime",
+        detail: richDetail,
+        action: "retry",
+        actionLabel: "Retry"
+      };
+    }
+    return {
+      message: `${label}${m} timed out — the model didn't respond in time`,
+      detail: richDetail,
+      action: "retry",
+      actionLabel: "Retry"
+    };
+  }
+  if (errObj?.errorType === "aborted" || /operation was aborted/i.test(raw)) {
+    const attributed = Boolean(errorProvider || model);
+    const m = model ? ` (${modelShortName(model)})` : "";
+    return {
+      message: attributed
+        ? `${label}${m} — request stopped before the model finished`
+        : "The request was stopped before the model responded.",
+      detail: richDetail,
+      action: "retry",
+      actionLabel: "Retry"
+    };
+  }
+
   // Handle structured ProviderError messages (they already contain the correct provider)
   // Pattern: "OpenRouter request failed (HTTP 402). ..."
   const structuredMatch = raw.match(/^(OpenRouter|Gemini|Groq|MiniMax)\s+(request failed|hit|error)/i);
@@ -284,6 +322,30 @@ export function translateError(err: unknown, provider?: ModelProvider): ErrorInf
       detail: richDetail,
       action: "settings",
       actionLabel: "Open Settings"
+    };
+  }
+  if (/ollama.*(not running|isn't running|server|reach the ollama|start ollama)/i.test(raw)) {
+    return {
+      message: "Ollama isn't running — open the Ollama app to use local models.",
+      detail: richDetail,
+      action: "retry",
+      actionLabel: "Open Ollama"
+    };
+  }
+  if (/ollama.*(not installed|download it)/i.test(raw)) {
+    return {
+      message: "Ollama is not installed. Download it from ollama.com",
+      detail: richDetail,
+      action: "retry",
+      actionLabel: "Open Settings"
+    };
+  }
+  if (/ollama.*(not found|pull it first|model.*not)/i.test(raw)) {
+    return {
+      message: "The selected Ollama model is not available locally. Pull it with `ollama pull <model>` and refresh models.",
+      detail: richDetail,
+      action: "fixModel",
+      actionLabel: "Refresh Models"
     };
   }
   if (/network|fetch failed|failed to fetch|enotfound|econnrefused|eai_again|unable to reach/i.test(raw)) {
