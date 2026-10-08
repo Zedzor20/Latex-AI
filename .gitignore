@@ -1,3 +1,10 @@
+# Electron-builder and distribution outputs
+dist/
+release/
+out/
+
+# Vite or other bundler build outputs (if using them)
+build/
 # Logs
 logs
 *.log
