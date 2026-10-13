@@ -5,7 +5,7 @@ import fg from "fast-glob";
 import { createTwoFilesPatch } from "diff";
 import type { FileOperationResult, FileTreeNode, FilesystemAccess, PendingChange, WorkspaceInfo } from "../shared/types.js";
 import { changeKindOf, describeFileChange, editNote } from "./taskSummary.js";
-import { ensureInsideWorkspace, fullAccessPath, id, realSafePath, safePath } from "./security.js";
+import { ensureInsideWorkspace, fullAccessPath, id, isRootEquivalentTarget, realSafePath, resolveNewFolderPath, safePath } from "./security.js";
 
 const TEXT_EXTENSIONS = new Set([
   ".js", ".ts", ".tsx", ".jsx", ".py", ".java", ".c", ".cpp", ".cs", ".html", ".css", ".json", ".xml", ".yaml", ".yml", ".md", ".gradle", ".properties", ".toml", ".rs", ".go", ".php", ".sql", ".txt", ".env", ".gitignore"
@@ -13,12 +13,27 @@ const TEXT_EXTENSIONS = new Set([
 
 const IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "release", "out", ".cache", "target", ".next", ".vite"]);
 
-function ok(operation: string, filePath?: string): FileOperationResult {
-  return { success: true, operation, path: filePath, verified: true };
+function ok(operation: string, filePath?: string, resolvedPath?: string): FileOperationResult {
+  return { success: true, operation, path: filePath, resolvedPath, verified: true };
 }
 
-function fail(operation: string, error: string, filePath?: string): FileOperationResult {
-  return { success: false, operation, path: filePath, verified: false, error };
+function fail(operation: string, error: string, filePath?: string, resolvedPath?: string): FileOperationResult {
+  return { success: false, operation, path: filePath, resolvedPath, verified: false, error };
+}
+
+/**
+ * Error for a write target that names the workspace root (or nothing at all).
+ *
+ * A file operation needs a real NAME; `.` is the workspace folder, not a file
+ * and not a new folder, so it is refused before any filesystem call rather than
+ * being resolved to the root and silently becoming a no-op.
+ */
+function rootTargetError(operation: string, target: string): FileOperationResult {
+  return fail(
+    operation,
+    `A name is required (received "${(target ?? "").trim() || "."}"). That path is the workspace folder itself, so nothing was created or changed.`,
+    target
+  );
 }
 
 async function exists(target: string): Promise<boolean> {
@@ -298,13 +313,14 @@ export class FileTools {
   }
 
   async createFile(workspaceRoot: string | undefined, relativePath: string, content: string): Promise<FileOperationResult> {
+    if (isRootEquivalentTarget(relativePath)) return rootTargetError("create_file", relativePath);
     const target = await this.resolveWritePath(workspaceRoot, relativePath);
-    if (await exists(target)) return fail("create_file", `The file ${relativePath} already exists.`, relativePath);
+    if (await exists(target)) return fail("create_file", `The file ${relativePath} already exists.`, relativePath, target);
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, content, "utf8");
     const written = await fs.readFile(target, "utf8").catch(() => null);
     if (written !== content) throw new Error(`Failed to verify the creation of ${relativePath}.`);
-    return ok("create_file", relativePath);
+    return ok("create_file", relativePath, target);
   }
 
   async editFile(workspaceRoot: string | undefined, relativePath: string, oldText: string, newText: string): Promise<FileOperationResult> {
@@ -320,7 +336,7 @@ export class FileTools {
     if (written === null || !written.includes(newText)) {
       throw new Error(`Failed to verify the edit to ${relativePath}.`);
     }
-    return ok("edit_file", relativePath);
+    return ok("edit_file", relativePath, target);
   }
 
   async deleteFile(workspaceRoot: string | undefined, relativePath: string): Promise<FileOperationResult> {
@@ -330,18 +346,18 @@ export class FileTools {
     await fs.unlink(target);
     const verified = !(await exists(target));
     if (!verified) throw new Error(`Failed to verify the deletion of ${relativePath}.`);
-    return ok("delete_file", relativePath);
+    return ok("delete_file", relativePath, target);
   }
 
   async deleteDirectory(workspaceRoot: string | undefined, relativePath: string): Promise<FileOperationResult> {
+    if (isRootEquivalentTarget(relativePath)) return fail("delete_directory", "Refusing to delete the workspace root.", relativePath);
     const target = await this.resolvePath(workspaceRoot, relativePath);
-    if (relativePath === "." || relativePath === "") return fail("delete_directory", "Refusing to delete the workspace root.");
     const stat = await fs.stat(target);
     if (stat.isFile()) return fail("delete_directory", `${relativePath} is a file; use delete_file.`, relativePath);
     await fs.rm(target, { recursive: true, force: false });
     const verified = !(await exists(target));
     if (!verified) throw new Error(`Failed to verify the deletion of ${relativePath}.`);
-    return ok("delete_directory", relativePath);
+    return ok("delete_directory", relativePath, target);
   }
 
   async renameFile(workspaceRoot: string | undefined, from: string, to: string): Promise<FileOperationResult> {
@@ -352,10 +368,11 @@ export class FileTools {
     await fs.rename(source, destination);
     const verified = !(await exists(source)) && (await exists(destination));
     if (!verified) throw new Error(`Failed to verify the rename of ${from}.`);
-    return ok("rename_file", to);
+    return ok("rename_file", to, destination);
   }
 
   async copyFile(workspaceRoot: string | undefined, from: string, to: string): Promise<FileOperationResult> {
+    if (isRootEquivalentTarget(to)) return rootTargetError("copy_file", to);
     const source = await this.resolvePath(workspaceRoot, from);
     const destination = await this.resolveWritePath(workspaceRoot, to);
     if (!(await exists(source))) return fail("copy_file", `The file ${from} does not exist.`, from);
@@ -365,15 +382,37 @@ export class FileTools {
     if (a === null || b === null || Buffer.compare(a, b) !== 0) {
       throw new Error(`Failed to verify the copy to ${to}.`);
     }
-    return ok("copy_file", to);
+    return ok("copy_file", to, destination);
   }
 
+  /**
+   * Create a folder at a REAL destination inside the workspace.
+   *
+   * `.` (the workspace root) is refused with a clear message instead of being
+   * resolved to the root and reported as "Created folder `.`"; the resolved
+   * ABSOLUTE destination is returned and re-verified on disk, so a success here
+   * is always a folder that exists at a named path.
+   */
   async createDirectory(workspaceRoot: string | undefined, relativePath: string): Promise<FileOperationResult> {
-    const target = await this.resolveWritePath(workspaceRoot, relativePath);
+    let target: string;
+    try {
+      target = await resolveNewFolderPath(workspaceRoot, relativePath);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return fail("create_directory", message, relativePath);
+    }
+    if (await exists(target)) {
+      const stat = await fs.stat(target);
+      if (stat.isDirectory()) {
+        // Already there — a real, verified destination, but not a new change.
+        return { ...ok("create_directory", relativePath, target), alreadyExisted: true };
+      }
+      return fail("create_directory", `"${relativePath}" already exists as a file.`, relativePath, target);
+    }
     await fs.mkdir(target, { recursive: true });
-    const stat = await fs.stat(target);
-    if (!stat.isDirectory()) throw new Error(`Failed to verify the directory ${relativePath}.`);
-    return ok("create_directory", relativePath);
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat || !stat.isDirectory()) throw new Error(`Failed to verify the directory ${relativePath} at ${target}.`);
+    return ok("create_directory", relativePath, target);
   }
 
   // ---------- tree ----------

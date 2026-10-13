@@ -79,19 +79,48 @@ export const IMAGE_GENERATION_INTENT_PATTERN =
  * "create a description of this image" satisfies the generation pattern's verb
  * and noun, so this guard is what keeps it a vision turn.
  */
-export const IMAGE_UNDERSTANDING_INTENT_PATTERN =
-  /\b(?:what|which|who|where|when|why|how)\b[^.!?]{0,40}\b(?:image|picture|photo|screenshot|this)\b|\b(?:describ\w*|explanation|explain|analy[sz]\w*|read|interpret\w*|identif\w*|recogni[sz]\w*|extract|transcri\w*|summari[sz]\w*|caption\w*|review|critique|compare)\b[^.!?]{0,40}\b(?:image|picture|photo|screenshot|diagram|chart|logo|attachment)\b|\b(?:image|picture|photo|screenshot)\s+(?:understanding|analysis|description|recognition|captioning)\b|\bwhat(?:'s| is)\s+(?:in|on)\s+(?:this|the|that)\s+(?:image|picture|photo|screenshot)\b/i;
+/** A question ABOUT a picture. */
+export const IMAGE_UNDERSTANDING_QUESTION =
+  /\b(?:what|which|who|where|when|why|how)\b[^.!?]{0,40}\b(?:image|picture|photo|screenshot|diagram|chart|logo|this)\b/i;
+
+/**
+ * A word that asks for an ANSWER about a picture — not just the verb form.
+ *
+ * "description" and "analysis" count exactly like "describe" and "analyse":
+ * "create a description of this image" is a vision turn that happens to contain
+ * a production verb, which is precisely the case that must not become an image
+ * request.
+ */
+export const IMAGE_UNDERSTANDING_ACTION =
+  /\b(?:descri|explain|analys|analyz|interpret|identif|recogni|transcrib|summari|summariz|caption|read|extract|review|critique|compare|understand)\w*\b/i;
+
+/** The thing an answer would be about. */
+export const IMAGE_UNDERSTANDING_SUBJECT =
+  /\b(?:image|picture|photo|screenshot|diagram|chart|logo|attachment|artwork)\b/i;
+
+/**
+ * True when the prompt asks Latex to LOOK AT an image rather than make one.
+ *
+ * Composed from three small, readable predicates instead of one giant
+ * alternation, so each rule can be read (and tested) on its own.
+ */
+export function imageUnderstandingIntent(text: string): boolean {
+  const value = (text ?? "").trim();
+  if (!value) return false;
+  if (IMAGE_UNDERSTANDING_QUESTION.test(value)) return true;
+  return IMAGE_UNDERSTANDING_ACTION.test(value) && IMAGE_UNDERSTANDING_SUBJECT.test(value);
+}
 
 /**
  * True only for an explicit image-GENERATION request.
  *
  * A prompt that asks about an image is never one, even when it happens to
- * contain a production verb: the understanding pattern wins.
+ * contain a production verb: understanding wins over generation.
  */
 export function imageGenerationIntent(text: string): boolean {
   const value = (text ?? "").trim();
   if (!value) return false;
-  if (IMAGE_UNDERSTANDING_INTENT_PATTERN.test(value)) return false;
+  if (imageUnderstandingIntent(value)) return false;
   return IMAGE_GENERATION_INTENT_PATTERN.test(value);
 }
 

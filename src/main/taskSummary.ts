@@ -26,12 +26,15 @@
 
 import { createTwoFilesPatch } from "diff";
 import type {
+  GeneratedResult,
   PendingChange,
   TaskChangeSummary,
   TaskControl,
   TaskOperation,
-  TaskOperationType
+  TaskOperationType,
+  TaskResultState
 } from "../shared/types.js";
+import { generatedResultClause } from "../shared/generatedResults.js";
 
 export type { TaskChangeSummary, TaskControl, TaskOperation, TaskOperationType };
 
@@ -499,7 +502,26 @@ export class TaskChangeRecorder {
     const constructs = detectConstructs(content || command || "");
     const resultObj = (result && typeof result === "object" ? result : {}) as Record<string, unknown>;
     const exitCode = typeof resultObj.exitCode === "number" ? resultObj.exitCode : null;
+    // A tool that reports `verified: false` did NOT succeed, whatever its
+    // `success` flag said — the record must never claim an unverified change.
     const verified = typeof resultObj.verified === "boolean" ? resultObj.verified : undefined;
+    const resolvedPath = typeof resultObj.resolvedPath === "string" ? resultObj.resolvedPath : undefined;
+    const alreadyExisted = resultObj.alreadyExisted === true;
+    // Failures carry their real, actionable reason: the tool's own error text, a
+    // plain rejection string, or the thrown message. Never a bare "failed".
+    const rawError = success
+      ? undefined
+      : typeof result === "string"
+        ? result
+        : typeof resultObj.error === "string"
+          ? resultObj.error
+          : typeof resultObj.reason === "string"
+            ? resultObj.reason
+            : typeof resultObj.message === "string"
+              ? resultObj.message
+              : undefined;
+    const error = rawError ? rawError.replace(/\s+/g, " ").trim().slice(0, 400) : undefined;
+    const effectiveSuccess = success && verified !== false;
 
     const operation: TaskOperation = {
       type,
@@ -507,20 +529,28 @@ export class TaskChangeRecorder {
       ...(path ? { path } : {}),
       ...(from ? { from } : {}),
       ...(to ? { to } : {}),
-      status,
+      status: effectiveSuccess ? "success" : status === "rejected" ? "rejected" : "failed",
       ...(verified !== undefined ? { verified } : {}),
+      ...(resolvedPath ? { resolvedPath } : {}),
+      ...(error ? { error } : {}),
+      ...(alreadyExisted ? { alreadyExisted } : {}),
       ...(command ? { command } : {}),
       ...(type === "command" ? { exitCode } : {}),
       at: Date.now(),
-      description: describeOperation(type, tool, { path, from, to, command, exitCode }, constructs, success),
+      description: describeOperation(
+        type,
+        tool,
+        { path, from, to, command, exitCode, resolvedPath, error, alreadyExisted },
+        constructs,
+        effectiveSuccess
+      ),
       constructs,
       mutating
     };
     this.operations.push(operation);
 
-    if (mutating && success) this.recordChange(operation, args, content);
-    if (type === "command") this.recordCommand(operation, success, exitCode);
-    else if (!success) { /* handled by callers through the failed list */ }
+    if (mutating && effectiveSuccess && !alreadyExisted) this.recordChange(operation, args, content);
+    if (type === "command") this.recordCommand(operation, effectiveSuccess, exitCode);
 
     return operation;
   }
@@ -719,29 +749,80 @@ function trimCommand(command: string): string {
   return command.length > 60 ? `${command.slice(0, 60)}…` : command;
 }
 
+interface OperationParts {
+  path?: string;
+  from?: string;
+  to?: string;
+  command?: string;
+  exitCode?: number | null;
+  /** Absolute path the operation really resolved to (never `.`). */
+  resolvedPath?: string;
+  /** Why a failure failed — shown so the answer can name a real cause. */
+  error?: string;
+  /** The target already existed (a confirmation, not a created change). */
+  alreadyExisted?: boolean;
+}
+
+/**
+ * A truthful label for a path a tool touched.
+ *
+ * `.` is the workspace ROOT, not a file named ".". When an inspect/list ran
+ * against the root, the resolved absolute folder is named instead — the user
+ * reported "Inspected `.`", which told them nothing about WHERE the agent looked.
+ */
+function describeTargetPath(parts: OperationParts): string {
+  if (isRootEquivalentPath(parts.path)) {
+    return parts.resolvedPath ? `${parts.resolvedPath}` : "the workspace root";
+  }
+  return parts.path ?? "file";
+}
+
+/** True for a tool path that names the workspace root rather than a child. */
+export function isRootEquivalentPath(target: string | undefined): boolean {
+  const cleaned = (target ?? "").trim().replace(/[\\/]+$/, "");
+  if (!cleaned) return true;
+  const named = cleaned.split(/[\\/]+/).filter((part) => part && part !== "." && part !== "..");
+  return named.length === 0;
+}
+
+function failureCause(parts: OperationParts): string {
+  const error = (parts.error ?? "").replace(/\s+/g, " ").trim();
+  if (!error) {
+    const exitCode = parts.exitCode;
+    if (exitCode !== null && exitCode !== undefined && exitCode !== 0) return ` (exit ${exitCode})`;
+    return "";
+  }
+  return ` — ${error.length > 140 ? `${error.slice(0, 140)}…` : error}`;
+}
+
 function describeOperation(
   type: TaskOperationType,
   tool: string,
-  parts: { path?: string; from?: string; to?: string; command?: string; exitCode?: number | null },
+  parts: OperationParts,
   constructs: string[],
   success: boolean
 ): string {
   const suffix = constructs.length > 0 ? ` (${constructs.slice(0, 3).join(", ")})` : "";
+  const cause = success ? "" : failureCause(parts);
   const prefix = success ? "" : "Failed: ";
   switch (type) {
-    case "file_create": return `${prefix}Created \`${parts.path ?? "file"}\`${suffix}`;
-    case "file_write": return `${prefix}Wrote \`${parts.path ?? "file"}\`${suffix}`;
-    case "file_edit": return `${prefix}Edited \`${parts.path ?? "file"}\`${suffix}`;
-    case "file_delete": return `${prefix}Deleted \`${parts.path ?? "file"}\``;
-    case "file_rename": return `${prefix}Renamed \`${parts.from ?? "?"}\` → \`${parts.to ?? "?"}\``;
-    case "file_move": return `${prefix}Moved \`${parts.from ?? "?"}\` → \`${parts.to ?? "?"}\``;
-    case "file_copy": return `${prefix}Copied \`${parts.from ?? "?"}\` → \`${parts.to ?? "?"}\``;
-    case "folder_create": return `${prefix}Created folder \`${parts.path ?? "folder"}\``;
-    case "folder_delete": return `${prefix}Deleted folder \`${parts.path ?? "folder"}\``;
-    case "command": return `${prefix}Ran \`${trimCommand(parts.command ?? "command")}\`${parts.exitCode !== null && parts.exitCode !== undefined ? ` (exit ${parts.exitCode})` : ""}`;
-    case "read": return `Read \`${parts.path ?? "file"}\``;
-    case "inspect": return `Inspected \`${parts.path ?? "workspace"}\``;
-    default: return `${prefix}${tool.replace(/_/g, " ")}${suffix}`;
+    case "file_create": return `${prefix}Created \`${parts.path ?? "file"}\`${suffix}${cause}`;
+    case "file_write": return `${prefix}Wrote \`${parts.path ?? "file"}\`${suffix}${cause}`;
+    case "file_edit": return `${prefix}Edited \`${parts.path ?? "file"}\`${suffix}${cause}`;
+    case "file_delete": return `${prefix}Deleted \`${parts.path ?? "file"}\`${cause}`;
+    case "file_rename": return `${prefix}Renamed \`${parts.from ?? "?"}\` → \`${parts.to ?? "?"}\`${cause}`;
+    case "file_move": return `${prefix}Moved \`${parts.from ?? "?"}\` → \`${parts.to ?? "?"}\`${cause}`;
+    case "file_copy": return `${prefix}Copied \`${parts.from ?? "?"}\` → \`${parts.to ?? "?"}\`${cause}`;
+    case "folder_create":
+      // A folder that was already there is a CONFIRMATION, never a creation.
+      return success && parts.alreadyExisted
+        ? `Confirmed folder \`${parts.path ?? "folder"}\` already exists${parts.resolvedPath ? ` at \`${parts.resolvedPath}\`` : ""}`
+        : `${prefix}Created folder \`${parts.path ?? "folder"}\`${parts.resolvedPath ? ` at \`${parts.resolvedPath}\`` : ""}${cause}`;
+    case "folder_delete": return `${prefix}Deleted folder \`${parts.path ?? "folder"}\`${cause}`;
+    case "command": return `${prefix}Ran \`${trimCommand(parts.command ?? "command")}\`${parts.exitCode !== null && parts.exitCode !== undefined ? ` (exit ${parts.exitCode})` : ""}${cause}`;
+    case "read": return `Read \`${describeTargetPath(parts)}\``;
+    case "inspect": return `Inspected \`${describeTargetPath(parts)}\``;
+    default: return `${prefix}${tool.replace(/_/g, " ")}${suffix}${cause}`;
   }
 }
 
@@ -798,6 +879,19 @@ export interface TaskReportInput {
    * "What remains" so a failed run is never dressed up as a completed one.
    */
   incompleteReason?: string;
+  /**
+   * The REAL results this turn produced that are not file changes — generated
+   * images, graphs, charts, artifacts. "No filesystem change" is not
+   * "nothing happened": with one of these the answer acknowledges it instead
+   * of claiming there was nothing to do.
+   */
+  generatedResults?: GeneratedResult[];
+  /**
+   * The real outcome state derived from the WHOLE verified result. When absent
+   * it is inferred from the summary + generated results, so every existing
+   * caller keeps its current behaviour.
+   */
+  taskResult?: TaskResultState;
 }
 
 /** The report split so the finalization step can stream what is still unseen. */
@@ -1027,8 +1121,33 @@ export function composeTaskReportParts(input: TaskReportInput): TaskReportParts 
     : ranCommands.length === 1
       ? `I ran \`${trimCommand(ranCommands[0].command ?? "")}\``
       : `I ran ${ranCommands.length} commands`;
-  const headline = input.headline ?? actions ?? commandHeadline ?? "nothing needed to change";
-  const status = input.stopped ? "Stopped" : "Done";
+  // ── Generated results are RESULTS, not a missing outcome ──────────────
+  // A turn that produced a graph/image/chart/artifact has something real to
+  // report even when the filesystem is untouched, so the headline names it and
+  // the "nothing needed to change" fallback is never reached.
+  const generated = input.generatedResults ?? [];
+  const generatedClause = generatedResultClause(generated);
+  const fileHeadline = actions ?? commandHeadline;
+  const generatedHeadline = generatedClause
+    ? fileHeadline
+      ? `${fileHeadline} and ${generatedClause}`
+      : `I ${generatedClause}`
+    : undefined;
+  // ── Failures are an OUTCOME, not an absence of one ────────────────────
+  // "Done — nothing needed to change" over a run whose operations all failed is
+  // the exact misleading message this guards against: a task that produced
+  // nothing and failed is reported as a FAILURE with a real cause.
+  const failureCount = summary.failedOperations.length;
+  const producedSomething = Boolean(actions || commandHeadline || generatedClause);
+  const failureHeadline = failureCount === 0
+    ? undefined
+    : failureCount === 1
+      ? "that operation failed"
+      : `${failureCount} operations failed`;
+  const headline = input.headline ?? generatedHeadline ?? fileHeadline ?? failureHeadline ?? "nothing needed to change";
+  const status = input.stopped
+    ? "Stopped"
+    : (!producedSomething && failureCount > 0 ? "Couldn't finish" : "Done");
 
   const explanation = sanitizeExplanation(input.explanation ?? "");
 
@@ -1080,10 +1199,26 @@ export function composeTaskReportParts(input: TaskReportInput): TaskReportParts 
     sections.push(`### Checks\n\n${checkNotes.map((note) => `- ${note}`).join("\n")}`);
   }
 
-  if (summary.failedOperations.length > 0) {
-    paragraphs.push(summary.failedOperations.length === 1
+  if (failureCount > 0) {
+    paragraphs.push(failureCount === 1
       ? "One operation could not be completed."
-      : `${summary.failedOperations.length} operations could not be completed.`);
+      : `${failureCount} operations could not be completed.`);
+    // The actionable cause, from the tools' own error text. Detail stays here
+    // (and in Agent Activity) rather than being dumped as raw tool output.
+    const causes: string[] = [];
+    for (const op of summary.failedOperations) {
+      const reason = (op.error ?? "").replace(/\s+/g, " ").trim();
+      if (!reason) continue;
+      const label = isRootEquivalentPath(op.path)
+        ? op.resolvedPath ?? "the workspace root"
+        : op.path ?? op.to ?? op.command ?? op.tool.replace(/_/g, " ");
+      const line = `${label} — ${reason.length > 200 ? `${reason.slice(0, 200)}…` : reason}`;
+      if (!causes.includes(line)) causes.push(line);
+      if (causes.length >= 4) break;
+    }
+    if (causes.length > 0) {
+      sections.push(`### What went wrong\n\n${causes.map((line) => `- ${line}`).join("\n")}`);
+    }
   }
 
   // ── Sections that add information the prose does not already carry ──
@@ -1107,7 +1242,7 @@ export function composeTaskReportParts(input: TaskReportInput): TaskReportParts 
     sections.push(`### Controls\n\n${summary.controls.map(controlLine).join("\n")}`);
   }
 
-  if (summary.failedOperations.length > 0) {
+  if (failureCount > 0) {
     const lines = summary.failedOperations.slice(0, 6).map((op) => `- ${op.description}`);
     sections.push(`### Not completed\n\n${lines.join("\n")}`);
   }
@@ -1117,7 +1252,7 @@ export function composeTaskReportParts(input: TaskReportInput): TaskReportParts 
   }
 
   // ── Closing line: only when there is a real, useful next step ──
-  if (!input.incompleteReason && summary.failedOperations.length === 0) {
+  if (!input.incompleteReason && failureCount === 0) {
     const next = nextStepSentence(groups);
     if (next) paragraphs.push(next);
   }
@@ -1125,10 +1260,34 @@ export function composeTaskReportParts(input: TaskReportInput): TaskReportParts 
   const head = input.statusLabel
     ? `**${input.statusLabel}**`
     : `**${status} — ${headline}.**`;
-  const header = explanation ? `${head}\n\n${explanation}` : head;
-  const body = [paragraphs.join("\n\n"), sections.join("\n\n")].filter(Boolean).join("\n\n");
-  if (body) return { header, body, full: `${header}\n\n${body}` };
+  // ── A failed run does not lead with the model's optimistic prose ──────
+  // When NOTHING was produced and operations failed, the model's closing text
+  // ("I created the folder…") is a claim the verified result contradicts, so it
+  // is not promoted into the header. The honest status line leads instead and
+  // the causes follow — the model's own words remain visible in the streamed
+  // answer, never deleted.
+  const suppressExplanation = !producedSomething && failureCount > 0;
+  const header = explanation && !suppressExplanation ? `${head}\n\n${explanation}` : head;
+  const bodyParts = [paragraphs.join("\n\n"), sections.join("\n\n")].filter(Boolean).join("\n\n");
+  // For a failed run the status line is APPENDED with the report (the streamed
+  // answer is kept verbatim), so it must travel inside `body` too — otherwise a
+  // run whose prose is already on screen would never show that it failed.
+  const body = suppressExplanation
+    ? [head, bodyParts].filter(Boolean).join("\n\n")
+    : bodyParts;
+  if (body) return { header, body, full: `${header}\n\n${bodyParts}`.trim() };
   if (explanation) return { header, body: "", full: header };
+  // A generated result IS the answer — never claim the workspace was the only
+  // thing that could have changed.
+  if (generatedClause) return { header, body: "", full: header };
+  // Nothing produced AND operations failed: say so. "Nothing needed to change"
+  // is only ever reached when every operation really did what was asked.
+  if (failureCount > 0) {
+    const detail = failureCount === 1
+      ? "The operation did not complete — see the reason above."
+      : `None of the ${failureCount} operations completed — see the reasons above.`;
+    return { header, body: detail, full: `${header}\n\n${detail}` };
+  }
   return { header, body: "Nothing in the workspace needed to change.", full: `${header}\n\nNothing in the workspace needed to change.` };
 }
 

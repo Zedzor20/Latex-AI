@@ -15,6 +15,7 @@ import type {
   FileOperationPreview,
   FileTreeNode,
   GeneratedImage,
+  GeneratedResult,
   GeminiModel,
   LatexSettings,
   ModelProvider,
@@ -37,6 +38,8 @@ import { DiffViewer } from "./components/DiffViewer";
 import { FilePreview } from "./components/FilePreview";
 import { WhatsNewModal } from "./components/WhatsNewModal";
 import { translateError, safeMessage, type ErrorInfo, modelShortName } from "./lib/errors";
+import { mergeGeneratedResults } from "../../shared/generatedResults";
+import { normalizeAnswerText, reconcileFinalAnswer } from "../../shared/finalAnswer";
 import { flattenTree } from "./lib/format";
 import { classifyRequest, isWorkspaceOperation, pickModel, providerOfModel, PROVIDER_LABELS, type ModelChoice, type TaskKind } from "./lib/modelRouter";
 import { stabilizeStreamingMarkdown } from "./lib/streamMarkdown";
@@ -259,6 +262,11 @@ export default function App() {
   const [whatsNewReleases, setWhatsNewReleases] = useState<import("../../shared/updates").ReleaseEntry[]>([]);
   const [stream, setStream] = useState("");
   const [generatedImages, setGeneratedImages] = useState<GeneratedImage[]>([]);
+  // Live mirror of the durable GENERATED RESULTS (images, graphs, charts,
+  // artifacts) for the visible turn. On completion the saved assistant message
+  // owns them, exactly like generatedImages — so the graph does not vanish when
+  // the live task UI ends.
+  const [generatedResults, setGeneratedResults] = useState<GeneratedResult[]>([]);
   const [thinkingText, setThinkingText] = useState("");
   // Live high-level APPLICATION status. This is the AGENT ACTIVITY channel
   // (phase transitions, tool start/finish, verification) — a DIFFERENT stream
@@ -320,6 +328,8 @@ export default function App() {
     setStream(state.stream);
     setThinkingText(state.thinking);
     setActivityStatus(state.activityStatus);
+    setGeneratedImages(state.images);
+    setGeneratedResults(state.results);
     setFileOperations(state.files);
     setActivity(state.activity);
     setActivitySteps(state.steps);
@@ -1081,6 +1091,16 @@ export default function App() {
           if (isActive) setGeneratedImages(state.images);
         }
       }
+      if (event.type === "generated_result") {
+        // A REAL generated result committed by the agent (image / graph /
+        // chart / artifact). Its own durable list, deduplicated by resultId so
+        // a repeated event cannot stack the same graph twice.
+        const result = event.payload as GeneratedResult | undefined;
+        if (result && typeof result.resultId === "string") {
+          state.results = mergeGeneratedResults(state.results, result);
+          if (isActive) setGeneratedResults(state.results);
+        }
+      }
       if (event.type === "file_operation") {
         // Live file-writing preview (ACTIVITY channel). Aggregated by path, so
         // repeated writes to the same file update ONE entry instead of stacking
@@ -1158,9 +1178,24 @@ export default function App() {
         // conversation replaces the stream.
         flushThinkNow();
         flushStreamNow();
-        const doneConv = event.payload as Conversation | undefined;
-        const targetId = doneConv?.id ?? chatId;
+        const doneConvRaw = event.payload as Conversation | undefined;
+        const targetId = doneConvRaw?.id ?? chatId;
         const targetState = runStateFor(targetId);
+        // ── The streamed answer is authoritative ──────────────────────
+        // Captured BEFORE the stream buffer is cleared. Everything the user
+        // already read for this run, per chat.
+        const streamedThisRun = targetState.stream;
+        // Defensive reconciliation at the UI boundary: a completion payload can
+        // never make the visible answer shorter or different from the answer
+        // that was just streamed. (The main process already guarantees this;
+        // this is the net that catches a stale/partial payload arriving late.)
+        const doneConv = doneConvRaw ? repairDroppedStreamedAnswer(doneConvRaw, streamedThisRun) : doneConvRaw;
+        if (doneConvRaw && doneConv && doneConv !== doneConvRaw) {
+          // The persisted record lost streamed text — persist the repaired
+          // message so a chat switch, restart or restoration shows the same
+          // complete answer instead of the shortened one.
+          void window.latex.conversation.save(doneConv).catch(() => undefined);
+        }
         targetState.doneRun = true;
         targetState.busy = false;
         targetState.activityComplete = true;
@@ -1342,7 +1377,7 @@ export default function App() {
   const activeMessages = useMemo(
     () => [
       ...conversation.messages,
-      ...(stream || generatedImages.length > 0
+      ...(stream || generatedImages.length > 0 || generatedResults.length > 0
         ? [{
             id: "stream",
             role: "assistant" as const,
@@ -1352,14 +1387,15 @@ export default function App() {
             createdAt: Date.now(),
             meta: {
               streaming: true,
-              // Live generated images ride on the streaming message so they
-              // render through the SAME code path as a persisted message.
-              ...(generatedImages.length > 0 ? { generatedImages } : {})
+              // Live generated images/results ride on the streaming message so
+              // they render through the SAME code path as a persisted message.
+              ...(generatedImages.length > 0 ? { generatedImages } : {}),
+              ...(generatedResults.length > 0 ? { generatedResults } : {})
             }
           }]
         : [])
     ],
-    [conversation, stream, generatedImages]
+    [conversation, stream, generatedImages, generatedResults]
   );
 
   const hasChat = activeMessages.length > 0;
@@ -1829,12 +1865,14 @@ export default function App() {
     // The generated images now live on the SAVED assistant message meta; clear
     // the live mirror so only one copy renders.
     state.images = [];
+    state.results = [];
     if (isActive) {
       setActivityComplete(true);
       setBusy(false);
       setThinkingText("");
       setActivityStatus("");
       setGeneratedImages([]);
+      setGeneratedResults([]);
       setError(null);
     }
     // The agent persists activity steps in the message meta for every
@@ -3014,6 +3052,32 @@ function buildAttachmentMeta(attachments: Attachment[]): Record<string, unknown>
   return items.length > 0 ? { attachments: items } : undefined;
 }
 
+/**
+ * Repair a completion payload whose assistant message dropped text the user
+ * already saw stream.
+ *
+ * The main process already refuses to replace a streamed answer, so this is the
+ * last line of defence at the UI boundary: if a payload arrives late, partial
+ * or empty and its final message does NOT carry the streamed answer, the streamed
+ * text is folded back in. A payload that already contains everything is
+ * returned untouched (identical object), so nothing is rewritten needlessly.
+ */
+function repairDroppedStreamedAnswer(conversation: Conversation, streamedThisRun: string): Conversation {
+  const streamed = (streamedThisRun ?? "").trim();
+  if (!streamed || conversation.messages.length === 0) return conversation;
+  const last = conversation.messages[conversation.messages.length - 1];
+  if (!last || last.role !== "assistant" || last.meta?.streaming) return conversation;
+  const body = (last.content ?? "").split("\n\n_(Generation stopped by user)_")[0];
+  const streamedNorm = normalizeAnswerText(streamed);
+  const bodyNorm = normalizeAnswerText(body);
+  // The message already carries (at least) the streamed answer — nothing to do.
+  if (bodyNorm.includes(streamedNorm)) return conversation;
+  const reconciled = reconcileFinalAnswer(streamed, body);
+  if (!reconciled.content || reconciled.content === body) return conversation;
+  const repaired: ChatMessage = { ...last, content: reconciled.content };
+  return { ...conversation, messages: [...conversation.messages.slice(0, -1), repaired], updatedAt: Date.now() };
+}
+
 function buildWorkspaceContext(ws: Workspace, tree: FileTreeNode[]): string {
   const lines = [`Workspace: ${ws.name}`, `Path: ${ws.path}`, "", "Structure:"];
   const walk = (nodes: FileTreeNode[], depth: number) => {
@@ -3062,6 +3126,8 @@ interface ConvRunState {
   activityStatus: string;
   /** Images REALLY generated during this response (live mirror; persisted on the message). */
   images: GeneratedImage[];
+  /** Generated results (images, graphs, charts, artifacts) for this turn. */
+  results: GeneratedResult[];
   /** Live, aggregated per-file previews of real Main Agent file operations. */
   files: FileOperationPreview[];
   activity: string[];
@@ -3084,6 +3150,7 @@ function createEmptyRunState(): ConvRunState {
     thinking: "",
     activityStatus: "",
     images: [],
+    results: [],
     files: [],
     activity: [],
     steps: [],

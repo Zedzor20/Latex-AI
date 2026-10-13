@@ -7,13 +7,60 @@ export function id(prefix = "id"): string {
 }
 
 /**
+ * Is this tool path a request to act on the workspace ROOT itself?
+ *
+ * `.`, `./`, `.\`, `..`, an empty string and a bare drive/root separator all
+ * mean "the workspace folder, whatever it is" — which must NEVER be turned into
+ * a new-folder destination. The reported bug ("Created folder `.`") came from
+ * exactly this string reaching `mkdir`.
+ */
+export function isRootEquivalentTarget(target: string | undefined): boolean {
+  const cleaned = (target ?? "").trim().replace(/[\\/]+$/, "");
+  if (!cleaned) return true;
+  if (cleaned === "." || cleaned === "..") return true;
+  // ".", ".\\", "./.", ".\\a\\..", … — a path with no real name component.
+  const named = cleaned.split(/[\\/]+/).filter((part) => part && part !== "." && part !== "..");
+  return named.length === 0;
+}
+
+/**
+ * Validate and canonicalize the approved workspace root.
+ *
+ * A missing, blank, relative-only or inaccessible root must fail LOUDLY and
+ * early: falling back to `process.cwd()` (or to `.`) is how operations ended up
+ * running against an unintended directory. The caller asks the user to choose a
+ * folder instead.
+ */
+export async function requireWorkspaceRoot(workspaceRoot: string | undefined): Promise<string> {
+  const raw = (workspaceRoot ?? "").trim();
+  if (!raw || isRootEquivalentTarget(raw) || !path.isAbsolute(raw)) {
+    throw new Error(
+      "No workspace folder is selected. Open the folder you want Latex to work in (Workspace → Open Folder) and try again — Latex never guesses a location."
+    );
+  }
+  let root: string;
+  try {
+    root = await fs.realpath(raw);
+  } catch {
+    throw new Error(
+      `The workspace folder "${raw}" does not exist or cannot be opened. Choose an existing folder before running filesystem operations.`
+    );
+  }
+  const stat = await fs.stat(root).catch(() => null);
+  if (!stat || !stat.isDirectory()) {
+    throw new Error(`"${raw}" is not a folder. Choose a folder as the workspace first.`);
+  }
+  return root;
+}
+
+/**
  * Resolve `target` (a relative path from the approved workspace root) to an
  * absolute path and verify it stays inside the root. Resolves symlinks via the
  * real path of the parent directory, so a symlink pointing outside the
  * workspace is rejected. Never creates directories.
  */
 export async function safePath(workspaceRoot: string, target: string): Promise<string> {
-  const root = await fs.realpath(workspaceRoot);
+  const root = await requireWorkspaceRoot(workspaceRoot);
   const resolved = path.resolve(root, target);
   const parent = path.dirname(resolved);
   let realParent = parent;
@@ -31,41 +78,75 @@ export async function safePath(workspaceRoot: string, target: string): Promise<s
       } catch {
         tail.unshift(path.basename(current));
         const next = path.dirname(current);
-        if (next === current) throw new Error("Path is outside the approved workspace.");
+        if (next === current) throw outsideWorkspaceError(target, workspaceRoot);
         current = next;
       }
     }
     realParent = path.join(realParent, ...tail);
   }
   const finalPath = path.join(realParent, path.basename(resolved));
-  assertContained(root, finalPath);
+  assertContained(root, finalPath, target, workspaceRoot);
   return finalPath;
 }
 
-/** Like safePath but also creates missing parent directories (for writes). */
+/**
+ * Like safePath but also creates missing parent directories (for writes).
+ *
+ * CONTAINMENT IS CHECKED FIRST. The previous order created the parent folder
+ * and only then rejected the path, so a rejected out-of-workspace write still
+ * left directories behind on disk — a real, user-visible side effect of a
+ * failure.
+ */
 export async function realSafePath(workspaceRoot: string, target: string): Promise<string> {
-  const root = await fs.realpath(workspaceRoot);
+  const root = await requireWorkspaceRoot(workspaceRoot);
   const resolved = path.resolve(root, target);
+  assertContained(root, resolved, target, workspaceRoot);
   const parent = path.dirname(resolved);
+  assertContained(root, parent, target, workspaceRoot);
   await fs.mkdir(parent, { recursive: true }).catch(() => undefined);
   const realParent = await fs.realpath(parent);
   const finalPath = path.join(realParent, path.basename(resolved));
-  assertContained(root, finalPath);
+  assertContained(root, finalPath, target, workspaceRoot);
   return finalPath;
 }
 
 /** Resolve an existing path inside the workspace (read/list operations). */
 export async function ensureInsideWorkspace(workspaceRoot: string, target: string): Promise<string> {
-  const root = await fs.realpath(workspaceRoot);
+  const root = await requireWorkspaceRoot(workspaceRoot);
   const resolved = path.resolve(root, target);
-  assertContained(root, resolved);
+  assertContained(root, resolved, target, workspaceRoot);
   return resolved;
 }
 
-function assertContained(root: string, candidate: string): void {
+/**
+ * Resolve the destination for a NEW folder (create_directory).
+ *
+ * Separated from the generic write path because a folder creation has one extra
+ * failure mode that a file write does not: the "path" may really mean the
+ * workspace root itself (`.`), which must never become `mkdir`.
+ */
+export async function resolveNewFolderPath(workspaceRoot: string | undefined, target: string): Promise<string> {
+  if (isRootEquivalentTarget(target)) {
+    throw new Error(
+      `A folder NAME is required (received "${(target ?? "").trim() || "."}"). "${(workspaceRoot ?? "").trim() || "the workspace"}" is the workspace root itself — nothing was created.`
+    );
+  }
+  const root = await requireWorkspaceRoot(workspaceRoot);
+  const resolved = path.resolve(root, target);
+  assertContained(root, resolved, target, workspaceRoot);
+  return resolved;
+}
+
+function outsideWorkspaceError(target: string, workspaceRoot: string): Error {
+  return new Error(
+    `"${target}" is outside the workspace folder "${workspaceRoot}". Latex only works inside the selected workspace — choose that folder as the workspace, or enable Full PC Access in Settings → Permissions.`
+  );
+}
+
+function assertContained(root: string, candidate: string, target?: string, workspaceRoot?: string): void {
   const relative = path.relative(root, candidate);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error("Path is outside the approved workspace.");
+    throw outsideWorkspaceError(target ?? candidate, workspaceRoot ?? root);
   }
 }
 

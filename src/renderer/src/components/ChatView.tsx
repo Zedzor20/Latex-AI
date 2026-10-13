@@ -18,7 +18,7 @@ import {
   X
 } from "lucide-react";
 import { DiffLines } from "./DiffLines";
-import type { AgentActivityStep, AgentTaskPhase, AgentTaskTimings, ApprovalRequest, ChatMessage, FileOperationPreview, GeneratedImage, ModelProvider, PendingChange } from "../../../shared/types";
+import type { AgentActivityStep, AgentTaskPhase, AgentTaskTimings, ApprovalRequest, ChatMessage, FileOperationPreview, GeneratedImage, GeneratedResult, ModelProvider, PendingChange } from "../../../shared/types";
 import { phaseLabel } from "../lib/phases";
 import { activityCountLabel, activityCounts, activityPhase } from "../../../shared/taskActivity";
 import { normalizeThinkingText } from "../../../shared/thinkingText";
@@ -666,7 +666,19 @@ export function ChatView(props: ChatViewProps) {
   // — this is the WORKING → THINKING → RESPONDING transition, with no invented
   // content anywhere in it.
   const answering = Boolean(streamMsg?.content && streamMsg.content.trim().length > 0);
-  const thinkingSurface = Boolean(busy && thinkingCapable && !answering && !showLiveActivity);
+  // ── The Thinking SURFACE ────────────────────────────────────────────
+  // In Chat the box owns the turn while nothing else is on screen. In MAIN the
+  // activity timeline is visible from the first step, which previously
+  // suppressed this surface entirely — a model whose provider genuinely exposes
+  // reasoning then had no dedicated Thinking section until (and unless) a delta
+  // happened to land while the answer had not started. A model whose provider
+  // REALLY exposes reasoning now keeps its own Thinking panel in Main too: it
+  // shows the honest labelled state + timer, and the reasoning itself the
+  // moment the provider streams it. A model with no reasoning channel still
+  // gets no panel here (and no invented text).
+  const thinkingSurface = Boolean(
+    busy && thinkingCapable && !answering && (!showLiveActivity || thinkingExposesReasoning)
+  );
   const showRequestStatus = !showLiveActivity && !thinkingSurface && (busy || turnOutcome != null);
   // True only once the model has ACTUALLY streamed reasoning for this turn, so
   // the row can say "Thinking" without inventing a thinking channel.
@@ -779,6 +791,8 @@ export function ChatView(props: ChatViewProps) {
             waiting={thinkingWaiting}
             streaming={thinkingStreaming}
             startedAt={turnStartedAt}
+            // Exactly ONE elapsed clock per response: when the Main activity
+            // timeline is on screen it owns the timer, so this panel shows none.
             showElapsed={!showLiveActivity && thinkingSurface}
             expectsReasoning={Boolean(thinkingExposesReasoning)}
           />
@@ -1214,6 +1228,15 @@ function MessageBubbleImpl({
     if (!Array.isArray(imgs)) return [];
     return imgs.filter((img) => img && img.base64 && img.mimeType);
   }, [message.meta?.generatedImages]);
+  // Durable GENERATED RESULTS (images, graphs, charts, artifacts) persisted
+  // WITH this message. Read straight off the conversation, so a generated graph
+  // survives the Thinking box collapsing, the final response, a new message, a
+  // tab/chat switch and a restart — it never depends on the live task UI.
+  const generatedResults = useMemo(() => {
+    const results = message.meta?.generatedResults as GeneratedResult[] | undefined;
+    if (!Array.isArray(results)) return [];
+    return results.filter((r) => r && r.status === "completed" && r.resultId);
+  }, [message.meta?.generatedResults]);
   // Extract persisted image attachments from message meta
   const imageAttachments = useMemo(() => {
     const atts = message.meta?.attachments as Array<{ id: string; name: string; kind: string; base64?: string; mimeType?: string; size?: number }> | undefined;
@@ -1407,10 +1430,15 @@ function MessageBubbleImpl({
             : <MarkdownView content={liveTail} />}
         </div>
       )}
-      {/* Real generated images (provider image output). Their own block — the
-          picture is never mixed into the assistant prose or the activity rows,
-          and no base64 ever appears as visible text. */}
-      {!isUser && generatedImages.length > 0 && (
+      {/* Generated RESULTS (provider image output and real tool visuals). Their
+          own block — the picture/graph is never mixed into the assistant prose,
+          the Thinking box or the activity rows, and no base64 ever appears as
+          visible text. A message that carries the normalized results renders
+          from THOSE; older messages fall back to the legacy image grid. */}
+      {!isUser && generatedResults.length > 0 && (
+        <GeneratedResultsBlock results={generatedResults} onOpenImage={setLightboxSrc} />
+      )}
+      {!isUser && generatedResults.length === 0 && generatedImages.length > 0 && (
         <div className="msgImageGrid generatedImageGrid">
           {generatedImages.map((img) => (
             <button
@@ -1434,6 +1462,107 @@ function MessageBubbleImpl({
         </div>
       )}
     </article>
+  );
+}
+
+/**
+ * The persisted GENERATED RESULTS of one assistant message.
+ *
+ * Renders from normalized data only: an image result draws the picture, a graph
+ * or chart result draws its bounded series, and anything else is a titled card.
+ * Raw tool JSON is never rendered — the message carries the values a renderer
+ * needs, not the tool response.
+ */
+function GeneratedResultsBlock({
+  results,
+  onOpenImage
+}: {
+  results: GeneratedResult[];
+  onOpenImage: (src: string) => void;
+}) {
+  const images = results.filter((r) => r.kind === "image" && r.base64 && r.mimeType);
+  const visuals = results.filter((r) => r.kind !== "image" || !r.base64);
+  return (
+    <div className="generatedResultsBlock">
+      {images.length > 0 && (
+        <div className="msgImageGrid generatedImageGrid">
+          {images.map((img) => (
+            <button
+              key={img.resultId}
+              type="button"
+              className="msgImageThumb"
+              onClick={() => onOpenImage(`data:${img.mimeType};base64,${img.base64}`)}
+              title={`${img.title ?? "Generated result "} — click to view`}
+            >
+              <img
+                src={`data:${img.mimeType};base64,${img.base64}`}
+                alt={img.title ?? "Generated result"}
+                loading="lazy"
+              />
+            </button>
+          ))}
+        </div>
+      )}
+      {visuals.map((result) => {
+        const chart = result.data?.chart as
+          | { title?: string; type?: "bar" | "line" | "pie"; labels: string[]; values: number[] }
+          | undefined;
+        if ((result.kind === "graph" || result.kind === "chart") && chart && Array.isArray(chart.values) && chart.values.length > 0) {
+          return <GeneratedChart key={result.resultId} chart={chart} kind={result.kind} />;
+        }
+        return (
+          <div key={result.resultId} className="generatedResultCard">
+            <span className="generatedResultKind">{result.kind}</span>
+            <span className="generatedResultTitle">{result.title ?? "Generated result"}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** A tiny, dependency-free SVG chart for a normalized persisted series. */
+function GeneratedChart({
+  chart,
+  kind
+}: {
+  chart: { title?: string; type?: "bar" | "line" | "pie"; labels: string[]; values: number[] };
+  kind: string;
+}) {
+  const width = 420;
+  const height = 180;
+  const pad = 24;
+  const max = Math.max(...chart.values, 0) || 1;
+  const min = Math.min(...chart.values, 0);
+  const span = max - min || 1;
+  const step = chart.values.length > 1 ? (width - pad * 2) / (chart.values.length - 1) : 0;
+  const y = (v: number) => height - pad - ((v - min) / span) * (height - pad * 2);
+  const bars = chart.values.length <= 24;
+  const barWidth = bars ? (width - pad * 2) / chart.values.length : 0;
+  return (
+    <figure className="generatedChart">
+      {chart.title && <figcaption className="generatedChartTitle">{chart.title}</figcaption>}
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={chart.title ?? `${kind} result`}>
+        <line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} className="chartAxis" />
+        {bars
+          ? chart.values.map((v, i) => (
+              <rect
+                key={i}
+                x={pad + i * barWidth + barWidth * 0.1}
+                y={y(Math.max(v, min))}
+                width={barWidth * 0.8}
+                height={Math.abs(y(min) - y(Math.max(v, min)))}
+                className="chartBar"
+              />
+            ))
+          : (
+            <polyline
+              className="chartLine"
+              points={chart.values.map((v, i) => `${pad + i * step},${y(v)}`).join(" ")}
+            />
+          )}
+      </svg>
+    </figure>
   );
 }
 

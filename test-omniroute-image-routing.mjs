@@ -361,7 +361,11 @@ try {
     trap.error !== null && trap.error.message === IMAGE_ONLY_CHAT_MESSAGE && !/\/v1\/chat\/completions/.test(trap.error.message),
     trap.error?.message);
 } finally {
-  server.close();
+  // Close the stub cleanly: dropping keep-alive sockets first lets `close`
+  // finish immediately, so there is no pending handle left to trip libuv's
+  // shutdown assertion (UV_HANDLE_CLOSING) and mangle the exit code.
+  server.closeAllConnections?.();
+  await new Promise((done) => server.close(done));
 }
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
@@ -370,4 +374,7 @@ if (failures.length > 0) {
   for (const failure of failures) console.log(`  - ${failure}`);
 }
 rmSync(OUT, { recursive: true, force: true });
-process.exit(failures.length === 0 ? 0 : 1);
+// Set the exit code and let the process unwind on its own. Calling
+// `process.exit()` here tore down libuv handles that were still closing, which
+// printed a UV_HANDLE_CLOSING assertion and replaced the real exit status.
+process.exitCode = failures.length === 0 ? 0 : 1;

@@ -1,6 +1,7 @@
 import { BrowserWindow } from "electron";
 import path from "node:path";
-import type { AgentActivityStep, AgentEvent, AgentTaskPhase, AgentTaskStatus, AgentTaskTimings, Attachment, ChatMessage, Conversation, FileOperationEvent, FileOperationPreview, FilesystemAccess, GeminiModel, ModelProvider, PendingChange, ProviderError, TaskChangeSummary, Workspace } from "../shared/types.js";
+import type { AgentActivityStep, AgentEvent, AgentTaskPhase, AgentTaskStatus, AgentTaskTimings, Attachment, ChatMessage, Conversation, FileOperationEvent, FileOperationPreview, FilesystemAccess, GeneratedResult, GeminiModel, ModelProvider, PendingChange, ProviderError, TaskChangeSummary, TaskResultState, Workspace } from "../shared/types.js";
+import { generatedResultCounts, generatedResultFromImage, generatedResultFromToolResult, generatedResultSentence, mergeGeneratedResults, resolveTaskResultState } from "../shared/generatedResults.js";
 import { shouldFallback, classifyHttpStatus } from "../shared/types.js";
 import { LATEX_SYSTEM_PROMPT, LATEX_CHAT_PROMPT, LATEX_TOOL_PROTOCOL } from "../shared/systemPrompt.js";
 import { applyResponseContract } from "../shared/responseContract.js";
@@ -25,6 +26,15 @@ import { chatBoundaryNotice, detectWorkspaceClaims, normalizeChatResponse } from
 import { planIntentForRequest } from "../shared/taskActivity.js";
 import { imageGenerationCapability, preferredImageModelPattern, resolveThinkingEnabled } from "../shared/modelCapabilities.js";
 import { imageGenerationIntent } from "../shared/imageRouting.js";
+import {
+  CompletionGuard,
+  finalAnswerDiagnostic,
+  finalizationKey,
+  normalizeAnswerText,
+  pendingStreamText,
+  reconcileFinalAnswer,
+  type FinalAnswerReconciliation
+} from "../shared/finalAnswer.js";
 import { currentTurnHasImage, imagesOf, toProviderMessage, type ProviderMessage } from "../shared/vision.js";
 
 /** Text files whose final contents are analysed for features/controls. */
@@ -122,10 +132,19 @@ function toolResultFailed(name: string, result: unknown): boolean {
   return typeof exitCode === "number" && exitCode !== 0;
 }
 
-/** Shared success test for a finished tool call (result flags + real exit code). */
+/**
+ * Shared success test for a finished tool call (result flags + real exit code).
+ *
+ * `verified: false` is a FAILURE: a tool that reports it could not confirm the
+ * operation on disk must never be counted as a completed change — that is what
+ * let an unverified folder creation appear as a success.
+ */
 function toolCallSucceeded(name: string, result: unknown): boolean {
   const json = typeof result === "string" ? result : JSON.stringify(result ?? null);
   if (json.includes('"error"') || json.includes('"success": false')) return false;
+  const obj = result && typeof result === "object" ? (result as Record<string, unknown>) : undefined;
+  if (obj && obj.verified === false) return false;
+  if (obj && obj.cancelled === true) return false;
   return !toolResultFailed(name, result);
 }
 
@@ -361,6 +380,15 @@ export class Agent {
    */
   private _fileOperationsForMessage: FileOperationPreview[] = [];
   /**
+   * Durable GENERATED RESULTS for this message: images the provider really
+   * produced and visuals a real tool really returned. Persisted WITH the
+   * message so a generated graph/image survives Thinking collapsing, the final
+   * response, a new message, a tab/chat switch and a restart.
+   */
+  private _generatedResultsForMessage: GeneratedResult[] = [];
+  /** The real outcome state of the current turn (set during finalization). */
+  private _taskResultForMessage: TaskResultState | null = null;
+  /**
    * The turn's Change Review records (one entry per file, net diff).
    *
    * `collectChange` folds every real file mutation in here, and the finished
@@ -442,6 +470,16 @@ export class Agent {
    * runs only; `null` in Chat means no workspace mutation can ever be recorded.
    */
   private changes: TaskChangeRecorder | null = null;
+  /**
+   * ONCE-PER-MESSAGE COMPLETION GUARD.
+   *
+   * A run must finalize (and emit `done`) exactly ONE time. A duplicate
+   * completion, a late provider event or a second finalization pass would
+   * otherwise append/replace the assistant message the user is reading.
+   */
+  private readonly completionGuard = new CompletionGuard();
+  /** Development diagnostics for final-text decisions (opt-in, content-free). */
+  private readonly debugFinalAnswer = process.env.LATEX_DEBUG_FINAL_ANSWER === "1";
 
   constructor(
     private readonly store: AppStore,
@@ -456,6 +494,7 @@ export class Agent {
     this.currentConvId = conversation.id;
     this.taskStreamContent = "";
     this.streamedAnswerText = "";
+    this.completionGuard.clear();
     this.thinkingForTask = [];
     this.taskError = "";
     // Every delta/activity event of this run is tagged with its message id, so
@@ -639,6 +678,60 @@ export class Agent {
     }
   }
 
+  /**
+   * Emit the terminal `done` event at most ONCE per run/message.
+   *
+   * A duplicate `done` is what makes a finished answer change on screen: the
+   * renderer swaps in the payload's conversation again and a late event can win
+   * the race against the one the user is reading. The guard is keyed by the
+   * run's task+message identity, so a genuine second message is unaffected.
+   */
+  private emitDoneOnce(conversationId: string, conversation: Conversation): void {
+    const key = finalizationKey(this.currentTaskId, this.currentMessageId);
+    if (!this.completionGuard.claim(key)) {
+      console.log(`[Agent] Duplicate completion suppressed for ${key || "(unkeyed run)"} — the message was already finalized.`);
+      if (this.debugFinalAnswer) {
+        console.log(finalAnswerDiagnostic({
+          taskId: this.currentTaskId ?? undefined,
+          messageId: this.currentMessageId ?? undefined,
+          stage: "done-dedupe",
+          streamedLength: this.streamedAnswerText.length,
+          finalLength: 0,
+          source: "skipped",
+          preservedStreamed: true,
+          ignoredEmptyFinal: false,
+          rejectedReplacement: false
+        }));
+      }
+      return;
+    }
+    this.emit({ type: "done", conversationId, payload: conversation });
+  }
+
+  /**
+   * Record what happened to the final text (development diagnostics only).
+   *
+   * Content-free by construction: lengths and the DECISION are logged, never the
+   * answer itself, so no message body and no credential can reach the log.
+   */
+  private noteFinalAnswer(stage: string, reconciled: FinalAnswerReconciliation, candidate: string): void {
+    if (!this.debugFinalAnswer) return;
+    console.log(finalAnswerDiagnostic({
+      taskId: this.currentTaskId ?? undefined,
+      messageId: this.currentMessageId ?? undefined,
+      stage,
+      streamedLength: this.streamedAnswerText.length,
+      finalLength: (candidate ?? "").length,
+      source: reconciled.source,
+      preservedStreamed: reconciled.preservedStreamed,
+      ignoredEmptyFinal: reconciled.ignoredEmptyFinal,
+      rejectedReplacement: reconciled.rejectedReplacement
+    }));
+    if (reconciled.rejectedReplacement) {
+      console.warn("[Agent] A finalization payload tried to replace a longer streamed answer; the streamed answer was kept.");
+    }
+  }
+
   /** Checkpoint the accumulated assistant text (debounced by the manager). */
   private checkpointAssistantStream(): void {
     const taskId = this.currentTaskId;
@@ -785,15 +878,31 @@ export class Agent {
       const now = Date.now();
       const settings = this.store.getSettings();
       const usedProvider = providerOfModel(settings.selectedModel ?? "");
+      this._taskResultForMessage = resolveTaskResultState({
+        stopped: this.stopped,
+        failed: true,
+        filesChanged: taskSummary.counts.filesChanged,
+        successfulOperations: taskSummary.counts.succeeded,
+        failedOperations: taskSummary.counts.failed,
+        generatedResults: generatedResultCounts(this._generatedResultsForMessage).total,
+        hasAnswer: true
+      });
       const content = composeTaskReport({
         summary: taskSummary,
+        generatedResults: this._generatedResultsForMessage,
+        taskResult: this._taskResultForMessage,
         statusLabel: "The task stopped before completion",
         incompleteReason: `${reason.replace(/\s+/g, " ").trim().slice(0, 300)} — the remaining steps were not executed.`
       });
+      // The streamed answer is authoritative here too: a run that failed after
+      // producing real prose must not have that prose replaced by the report.
+      const reconciled = reconcileFinalAnswer(this.streamedAnswerText, content);
+      const finalContent = reconciled.content || content;
+      this.noteFinalAnswer("incomplete", reconciled, content);
       const message: ChatMessage = {
-        id: id("msg"),
+        id: this.currentMessageId ?? id("msg"),
         role: "assistant",
-        content,
+        content: finalContent,
         createdAt: now,
         startedAt: this.timings.taskStartedAt ?? now,
         completedAt: now,
@@ -803,11 +912,11 @@ export class Agent {
       };
       const next = { ...conversation, messages: [...conversation.messages, message], updatedAt: now };
       this.store.saveConversation(next);
-      this.taskStreamContent = content;
+      if (finalContent.length >= this.taskStreamContent.length) this.taskStreamContent = finalContent;
       this.checkpointAssistantStream();
       this.emitActivityStep("Finalizing response...", "done", "Summarized the completed work after the run stopped");
       this.emitActivityComplete();
-      this.emit({ type: "done", conversationId: conversation.id, payload: next });
+      this.emitDoneOnce(conversation.id, next);
       console.log(`[Agent] Persisted an incomplete-task summary (${taskSummary.counts.operations} operations, ${taskSummary.counts.filesChanged} files).`);
     } catch (finalizeErr) {
       console.error("[Agent] Failed to summarize the incomplete task:", finalizeErr);
@@ -827,6 +936,8 @@ export class Agent {
     this._activityStepsForMessage = [];
     this._fileOperationsForMessage = [];
     this._reviewChangesForMessage = [];
+    this._generatedResultsForMessage = [];
+    this._taskResultForMessage = null;
     // Same resource gate for the Chat path (local Ollama models only).
     if (isOllamaModel(settings.selectedModel)) {
       const gate = requestGate(settings.selectedModel);
@@ -966,11 +1077,26 @@ export class Agent {
       if (!gate.ok) throw new Error(gate.error ?? "Another Ollama generation is already running. Wait for it to finish or press Stop.");
     }
 
+    // ── The workspace must be a REAL folder we can name ────────────────
+    // `.`, an empty string or a relative path is not a workspace: it is the
+    // exact input that made a tool "inspect `.`" and try to "create folder `.`".
+    // It is dropped here, before any filesystem call, so every tool gets an
+    // honest "open a folder first" instead of acting on an unintended location.
+    const workspacePathRaw = (workspace?.path ?? "").trim();
+    const workspaceUsable = Boolean(workspace && workspacePathRaw && path.isAbsolute(workspacePathRaw));
+    const activeWorkspace = workspaceUsable ? workspace : undefined;
+    if (workspace && !workspaceUsable) {
+      const detail = `No usable workspace folder ("${workspacePathRaw || "."}") — filesystem operations are disabled until a folder is opened.`;
+      this.emitActivityStep("Workspace", "failed", detail, { kind: "verification" });
+      this.emitActivityStatus(detail);
+      console.warn(`[Agent] Ignoring unusable workspace path "${workspacePathRaw}" — no filesystem operation will run against it.`);
+    }
+
     const ctx: ToolContext = {
-      workspace,
+      workspace: activeWorkspace,
       settings,
       fileTools: this.fileTools,
-      mode,
+      mode: workspaceUsable ? mode : "workspace",
       collectChange: (change) => {
         // One entry per FILE for the whole turn: a model that writes the same
         // file five times produces one review row whose diff goes from the
@@ -1013,7 +1139,7 @@ export class Agent {
     while (attempts < MAX_AUTO_ATTEMPTS && !this.stopped) {
       attempts++;
       try {
-        return await this.runInnerWithModel(currentModel, conversation, workspace, attachments, ctx, factory, imageTurn);
+        return await this.runInnerWithModel(currentModel, conversation, activeWorkspace, attachments, ctx, factory, imageTurn);
       } catch (err) {
         releaseRequest(currentModel);
         const currentProvider = providerOfModel(currentModel);
@@ -1160,6 +1286,8 @@ export class Agent {
 
     this._activityStepsForMessage = [];
     this._fileOperationsForMessage = [];
+    this._generatedResultsForMessage = [];
+    this._taskResultForMessage = null;
     this.planStepId = null;
     this.lastActivityStatus = "";
     // New task → new execution registry: a command from a previous task must
@@ -1200,7 +1328,7 @@ export class Agent {
       // stateful filter, so a tool call split across chunks can never leak
       // raw protocol JSON into the chat. <thought> content goes to Thinking.
       const textFilter = new AssistantStreamFilter((thought) =>
-        this.emit({ type: "thinking", conversationId: conversation.id, payload: thought })
+        this.emitThinking(conversation.id, thought)
       );
       let liveStreamedText = "";
 
@@ -1243,7 +1371,7 @@ export class Agent {
             if (thinkText) {
               turnThinking += thinkText;
               this.noteThinking(thinkText);
-              this.emit({ type: "thinking", conversationId: conversation.id, payload: thinkText });
+              this.emitThinking(conversation.id, thinkText);
             }
           } else if (chunk.type === "image") {
             // Real image data — its own channel (never text, never a tool call).
@@ -1252,6 +1380,14 @@ export class Agent {
               emittedImageStep = true;
               this.emitActivityStep("Generating image", "active", modelName);
             }
+            this.emitGeneratedResult(
+              generatedResultFromImage(
+                { mimeType: chunk.mimeType, data: chunk.data },
+                { taskId: this.currentTaskId ?? undefined, messageId: this.currentMessageId ?? undefined },
+                taskImages.length - 1
+              ),
+              conversation.id
+            );
             this.emit({
               type: "image",
               conversationId: conversation.id,
@@ -1438,22 +1574,22 @@ export class Agent {
               thinkingDone = true;
               this.completePlanStep();
             }
-            // For the final text: if tools were executed, keep only the LAST meaningful paragraph
-            // to avoid repeating status messages
+            // The final text is the model's own conclusion. It is NEVER
+            // reduced to "the last paragraph": silently dropping the rest of a
+            // complete answer is exactly the "answer changed at the end" bug.
+            // When tools ran, the longer of the two forms is kept so no real
+            // prose is lost; when none ran, the text is accumulated as before.
             if (toolsExecuted > 0) {
               modelConcluded = true;
-              const paragraphs = cleanText.split(/\n\n+/).filter(p => p.trim().length > 0);
-              // Keep only the last meaningful paragraph (likely the summary)
-              const lastMeaningful = paragraphs.reverse().find(p => p.trim().length > 10 && !/^\s*(✅|File verified|Files? verified|Operations? completed)/.test(p));
-              if (lastMeaningful && lastMeaningful.trim().length > finalText.length) {
-                finalText = lastMeaningful.trim();
-              } else if (!finalText) {
-                finalText = cleanText;
-              }
+              const candidate = cleanText.trim();
+              if (candidate.length > finalText.length) finalText = candidate;
             } else {
               finalText += cleanText;
             }
-            this.taskStreamContent = finalText || cleanText;
+            // Never replace a longer accumulated stream with a shorter form:
+            // the checkpoint is what a reopened/restored conversation shows.
+            const turnFinal = finalText || cleanText;
+            if (turnFinal.length >= this.taskStreamContent.length) this.taskStreamContent = turnFinal;
             this.checkpointAssistantStream();
             // Re-emitting already-streamed text here is what made the answer
             // render twice while streaming — emit only genuine remainder.
@@ -1590,7 +1726,10 @@ export class Agent {
         ? `All ${toolsExecuted} operation${toolsExecuted === 1 ? "" : "s"} succeeded.`
         : `${toolsExecuted - successCount} of ${toolsExecuted} operations failed.`);
     }
-    this.setPhase("finalizing", "Preparing the final response...");
+    // The activity label states the REAL phase. It uses the same wording as the
+    // interrupted-run path ("Finalizing response...") so the timeline never
+    // describes one phase with two different names.
+    this.setPhase("finalizing", "Finalizing response...");
     // Operation-derived summary: built from REAL tool executions only. Reads the
     // changed source back (bounded), verifies local HTML references on disk, and
     // derives files/features/controls from that text — nothing is invented.
@@ -1602,6 +1741,24 @@ export class Agent {
         getTaskManager(this.store).checkpoint(this.currentTaskId, { changeSummary: taskSummary }, { immediate: true });
       } catch { /* summary persistence is best-effort */ }
     }
+    // ── The REAL task result ──────────────────────────────────────────
+    // Success is decided from the WHOLE verified result — file changes, real
+    // commands, generated images/graphs/charts — never from the filesystem
+    // alone. "No files changed" must never be read as "nothing happened".
+    // Only a MUTATION or a real command makes a run "successful": a read or an
+    // inspect that worked must never be able to turn "4 operations could not be
+    // completed" into "Done".
+    const successfulMutations = taskSummary.operations.filter((op) => op.mutating && op.status === "success").length;
+    const successfulCommands = taskSummary.operations.filter((op) => op.type === "command" && op.status === "success").length;
+    this._taskResultForMessage = resolveTaskResultState({
+      stopped: this.stopped,
+      failed: false,
+      filesChanged: taskSummary.counts.filesChanged,
+      successfulOperations: successfulMutations + successfulCommands,
+      failedOperations: taskSummary.counts.failed,
+      generatedResults: generatedResultCounts(this._generatedResultsForMessage).total,
+      hasAnswer: Boolean(this.streamedAnswerText.trim() || (safeFinalText ?? "").trim())
+    });
     let finalContent: string;
     if (toolsExecuted > 0) {
       // Lead with the model's own explanation when it produced one (that prose
@@ -1610,41 +1767,67 @@ export class Agent {
       const report = composeTaskReportParts({
         summary: taskSummary,
         explanation: modelConcluded && explanation.length > 40 ? explanation : undefined,
-        stopped: this.stopped
+        stopped: this.stopped,
+        generatedResults: this._generatedResultsForMessage,
+        taskResult: this._taskResultForMessage
       });
-      finalContent = report.full;
-      // Stream the summary through the normal assistant channel. If the model
-      // already streamed its own closing prose, only the sections are new; if it
-      // never wrote an answer (the "finished after the last tool call" case) the
-      // whole report is streamed. Nothing is streamed twice, and internal tool
-      // payloads never enter this channel.
-      const streamed = this.streamedAnswerText.replace(/\s+/g, " ").trim();
-      const head = explanation.slice(0, 60).replace(/\s+/g, " ").trim();
-      const proseAlreadyOnScreen = Boolean(streamed && head && streamed.includes(head));
-      this.streamFinalContent(proseAlreadyOnScreen ? report.body : report.full, conversation.id);
+      // ── The streamed answer is AUTHORITATIVE ─────────────────────────
+      // If the model already streamed its own closing prose, only the report's
+      // BODY (the operation-derived sections) is new; if it never wrote an
+      // answer (the "finished after the last tool call" case) the whole report
+      // is new. Either way the composed text may only APPEND to what the user
+      // already read — it can never shrink, rewrite or replace it.
+      const streamedNorm = normalizeAnswerText(this.streamedAnswerText);
+      const explanationNorm = normalizeAnswerText(explanation).slice(0, 200);
+      const proseAlreadyOnScreen = Boolean(streamedNorm && explanationNorm && streamedNorm.includes(explanationNorm));
+      const candidate = proseAlreadyOnScreen ? report.body : report.full;
+      const reconciled = reconcileFinalAnswer(this.streamedAnswerText, candidate);
+      finalContent = reconciled.content || (proseAlreadyOnScreen ? "" : report.full);
+      this.noteFinalAnswer("finalize", reconciled, candidate);
+      this.streamFinalContent(reconciled.pendingStream, conversation.id);
     } else if (safeFinalText && safeFinalText.trim().length > 0) {
-      // No tools used — use the model's text but limit length for clean display
-      const textLines = safeFinalText.trim().split("\n");
-      const body = textLines.length > 30
-        ? textLines.slice(0, 25).join("\n") + "\n\n_(Response truncated for brevity)_"
-        : safeFinalText.trim();
+      // No tools used. The ENTIRE answer is kept: long answers were previously
+      // cut at 25 lines, which is the same "answer changed at the end" symptom
+      // for anyone whose streamed reply was longer than that.
+      const body = safeFinalText.trim();
       // Main mode honesty guard: a model that claims it changed files without
       // executing a single tool must not be believed.
       const claims = detectWorkspaceClaims(body);
-      finalContent = claims.fileChange || claims.commandRun
+      const candidate = claims.fileChange || claims.commandRun
         ? `${body}\n\n_(No workspace operation was executed for this request — no files were changed.)_`
         : body;
+      const reconciled = reconcileFinalAnswer(this.streamedAnswerText, candidate);
+      finalContent = reconciled.content || candidate;
+      this.noteFinalAnswer("finalize-text", reconciled, candidate);
+      this.streamFinalContent(reconciled.pendingStream, conversation.id);
     } else {
-      // No model prose at all: still answer from the verified task result.
-      finalContent = taskSummary.counts.operations > 0
-        ? composeTaskReport({ summary: taskSummary })
-        : taskImages.length > 0
-          ? "Here's the generated image."
-          : "Task completed.";
-      this.streamFinalContent(finalContent, conversation.id);
+      // No model prose at all: still answer from the verified task result —
+      // including a generated graph/image, which is a result in its own right.
+      const generatedSentence = generatedResultSentence(this._generatedResultsForMessage);
+      const candidate = taskSummary.counts.operations > 0
+        ? composeTaskReport({
+            summary: taskSummary,
+            generatedResults: this._generatedResultsForMessage,
+            taskResult: this._taskResultForMessage
+          })
+        : generatedSentence
+          ? generatedSentence
+          : taskImages.length > 0
+            ? "Here's the generated image."
+            // Nothing at all came back: say so instead of claiming a task was
+            // completed. "Task completed." over an empty response is the same
+            // class of false success this finalization pass exists to remove.
+            : "The model returned an empty response, so nothing was changed.";
+      const reconciled = reconcileFinalAnswer(this.streamedAnswerText, candidate);
+      finalContent = reconciled.content || candidate;
+      this.noteFinalAnswer("finalize-empty", reconciled, candidate);
+      this.streamFinalContent(reconciled.pendingStream, conversation.id);
     }
     const message: ChatMessage = {
-      id: id("msg"),
+      // STABLE IDENTITY: the message id is the one every event of this run was
+      // tagged with, so the streamed answer, its activity, its file operations
+      // and the persisted message all name the same message.
+      id: this.currentMessageId ?? id("msg"),
       role: "assistant",
       content: finalContent + stoppedText,
       createdAt: now,
@@ -1659,7 +1842,7 @@ export class Agent {
     };
     const next = { ...conversation, messages: [...conversation.messages, message], updatedAt: now };
     this.store.saveConversation(next);
-    this.emit({ type: "done", conversationId: conversation.id, payload: next });
+    this.emitDoneOnce(conversation.id, next);
     return next;
   }
 
@@ -1880,6 +2063,7 @@ export class Agent {
         finishFileOp(failed ? "failed" : "complete", failed ? { error: "The operation did not complete." } : { verified: true });
         this.emitToolEvent(name, failed ? "error" : "ok", args, undefined, executed, stepId);
         this.noteToolOutcome(name, args, executed);
+        this.captureGeneratedResult(name, executed, failed, toolCallId, conversationId);
         this.recordToolEnd(toolCallId, name, args, toolPath, "completed", executed);
         this.rememberToolExecution(callKey, executed, failed, name);
         return executed;
@@ -1889,6 +2073,7 @@ export class Agent {
       finishFileOp(failed ? "failed" : "complete", failed ? { error: "The operation did not complete." } : { verified: true });
       this.emitToolEvent(name, failed ? "error" : "ok", args, undefined, executed, stepId);
       this.noteToolOutcome(name, args, executed);
+      this.captureGeneratedResult(name, executed, failed, toolCallId, conversationId);
       this.recordToolEnd(toolCallId, name, args, toolPath, "completed", executed);
       this.rememberToolExecution(callKey, executed, failed, name);
       return executed;
@@ -2166,6 +2351,29 @@ export class Agent {
     this.thinkingForTask.push(text);
   }
 
+  /**
+   * Emit ONE provider reasoning delta on the THINKING channel.
+   *
+   * Every provider goes through this single method, so the renderer receives
+   * reasoning with the SAME run identity as the answer it belongs to: the task,
+   * the chat and the message. That identity is what lets the Thinking panel keep
+   * following the right message across a Main/Chat switch, a conversation change
+   * and a restore. It never touches the assistant text channel — reasoning can
+   * never be appended to the visible answer, and it never blocks streaming.
+   */
+  private emitThinking(conversationId: string, text: string | undefined | null): void {
+    const clean = typeof text === "string" ? text : text == null ? "" : String(text);
+    // An empty delta carries no reasoning: emitting it would only churn state.
+    if (!clean) return;
+    this.emit({
+      type: "thinking",
+      conversationId,
+      taskId: this.currentTaskId ?? undefined,
+      messageId: this.currentMessageId ?? undefined,
+      payload: clean
+    });
+  }
+
   private emitActivityStatus(text: string | undefined | null): void {
     if (!text || this.stopped) return;
     const line = text.trim();
@@ -2418,7 +2626,7 @@ export class Agent {
     // Channel separation for the simple-chat path too: raw tool JSON, file
     // contents and shell payloads stay out of the assistant message.
     const chatTextFilter = new AssistantStreamFilter((thought) =>
-      this.emit({ type: "thinking", conversationId: conversation.id, payload: thought })
+      this.emitThinking(conversation.id, thought)
     );
     try {
       this.emitActivityStep("Planning response", "active");
@@ -2446,12 +2654,20 @@ export class Agent {
           if (thinkText) {
             turnThinking += thinkText;
             this.noteThinking(thinkText);
-            this.emit({ type: "thinking", conversationId: conversation.id, payload: thinkText });
+            this.emitThinking(conversation.id, thinkText);
           }
         } else if (chunk.type === "image") {
           // Real image data from the provider — its OWN channel, never mixed
           // into the assistant text or the activity timeline.
           turnImages.push({ mimeType: chunk.mimeType, data: chunk.data });
+          this.emitGeneratedResult(
+            generatedResultFromImage(
+              { mimeType: chunk.mimeType, data: chunk.data },
+              { taskId: this.currentTaskId ?? undefined, messageId: this.currentMessageId ?? undefined },
+              turnImages.length - 1
+            ),
+            conversation.id
+          );
           if (!emittedImageStep) {
             emittedImageStep = true;
             this.emitActivityStep("Generating image", "active", settings.selectedModel);
@@ -2597,6 +2813,57 @@ export class Agent {
   }
 
   /**
+   * Commit a REAL tool-produced visual to the turn's durable records.
+   *
+   * Called only after the tool actually succeeded: a failed, rejected or
+   * cancelled call can never create a result, and an ordinary text/JSON result
+   * creates nothing at all (so a read/list/search never becomes a "result").
+   * The record is keyed by the tool call's stable id, so a duplicate dispatch, a
+   * rerender or a restored task cannot stack the same graph twice.
+   */
+  private captureGeneratedResult(
+    name: string,
+    result: unknown,
+    failed: boolean,
+    toolCallId: string,
+    conversationId: string
+  ): void {
+    if (failed) return;
+    const generated = generatedResultFromToolResult(name, result, {
+      taskId: this.currentTaskId ?? undefined,
+      messageId: this.currentMessageId ?? undefined,
+      toolCallId
+    });
+    if (!generated) return;
+    this.emitGeneratedResult(generated, conversationId);
+  }
+
+  /**
+   * Fold one generated result into the durable list AND emit it live, so the
+   * result appears while the task runs and is still there when it finishes.
+   * Deduplicated by `resultId` on both sides.
+   */
+  private emitGeneratedResult(generated: GeneratedResult, conversationId: string): void {
+    const existing = this._generatedResultsForMessage.find((item) => item.resultId === generated.resultId);
+    // An identical result arriving twice (a repeated stream event, an IPC
+    // reconnect, a rerender) is already recorded — emit nothing.
+    if (existing && existing.status === generated.status) return;
+    this._generatedResultsForMessage = mergeGeneratedResults(this._generatedResultsForMessage, generated);
+    this.emit({ type: "generated_result", conversationId, payload: generated });
+  }
+
+  /**
+   * The durable generated-result metadata for this message, when there is any.
+   * Kept separate from the activity metadata so an image-only turn can persist
+   * its result without also adopting an activity timeline.
+   */
+  private generatedResultMeta(): Record<string, unknown> {
+    return this._generatedResultsForMessage.length > 0
+      ? { generatedResults: this._generatedResultsForMessage }
+      : {};
+  }
+
+  /**
    * Build persisted per-message activity metadata: force-closes any active
    * steps (so restored conversations never show stuck spinners) and includes
    * thinking + stop state for the collapsed activity row.
@@ -2619,6 +2886,17 @@ export class Agent {
       ...(this._reviewChangesForMessage.length > 0
         ? { reviewChanges: compactReviewChanges(this._reviewChangesForMessage) }
         : {}),
+      // The durable GENERATED RESULTS (images, graphs, charts, artifacts). They
+      // are stored with the message, independently of the Change Review, so a
+      // reopened chat rebuilds the graph from persisted data instead of
+      // depending on the live task UI or on React state.
+      ...(this._generatedResultsForMessage.length > 0
+        ? { generatedResults: this._generatedResultsForMessage }
+        : {}),
+      // The REAL outcome state, derived from the whole verified result. Kept on
+      // the message so a reopened chat can still tell "succeeded" from "nothing
+      // happened" without re-deriving it from filesystem counters.
+      ...(this._taskResultForMessage ? { taskResult: this._taskResultForMessage } : {}),
       ...(thinking ? { thinking } : {}),
       // The durable task this message belongs to — kept on the message so a
       // reopened chat can still trace the answer back to its recorded work.
@@ -2637,6 +2915,11 @@ export class Agent {
    */
   private generatedImageMeta(images: Array<{ mimeType: string; data: string }>): Record<string, unknown> {
     if (images.length === 0) return {};
+    // When the SAME images are already stored as durable generated results, the
+    // legacy `generatedImages` copy would double the base64 written to disk for
+    // every generated picture — the normalized result is the source of truth
+    // and the renderer reads it first.
+    if (this._generatedResultsForMessage.some((item) => item.kind === "image" && item.base64)) return {};
     return {
       generatedImages: images.map((img, index) => ({
         id: id("img"),
@@ -2672,6 +2955,7 @@ export class Agent {
     this._activityStepsForMessage = [];
     this._fileOperationsForMessage = [];
     this._reviewChangesForMessage = [];
+    this._generatedResultsForMessage = [];
     this.startRuntime(conversation, "chat", workspace, settings.selectedModel);
     try {
       const result = await this.performImageTurn(conversation, attachments);
@@ -2714,7 +2998,7 @@ export class Agent {
     this.runtimeGuard = guard;
     const signal = AbortSignal.any([this.abortController.signal, guard.signal]);
     const imageTextFilter = new AssistantStreamFilter((thought) =>
-      this.emit({ type: "thinking", conversationId: conversation.id, payload: thought })
+      this.emitThinking(conversation.id, thought)
     );
     this.setPhase("requesting_model", `Request sent to ${settings.selectedModel}`);
     this.setPhase("waiting_for_provider", "Waiting for model response...");
@@ -2746,7 +3030,7 @@ export class Agent {
           if (thinkText) {
             turnThinking += thinkText;
             this.noteThinking(thinkText);
-            this.emit({ type: "thinking", conversationId: conversation.id, payload: thinkText });
+            this.emitThinking(conversation.id, thinkText);
           }
         } else if (chunk.type === "image") {
           turnImages.push({ mimeType: chunk.mimeType, data: chunk.data });
@@ -2754,6 +3038,14 @@ export class Agent {
             emittedImageStep = true;
             this.emitActivityStep("Generating image", "active", settings.selectedModel);
           }
+          this.emitGeneratedResult(
+            generatedResultFromImage(
+              { mimeType: chunk.mimeType, data: chunk.data },
+              { taskId: this.currentTaskId ?? undefined, messageId: this.currentMessageId ?? undefined },
+              turnImages.length - 1
+            ),
+            conversation.id
+          );
           this.emit({
             type: "image",
             conversationId: conversation.id,
@@ -2798,7 +3090,7 @@ export class Agent {
               completedAt: now,
               model: settings.selectedModel,
               provider: providerOfModel(settings.selectedModel),
-              meta: { ...this.generatedImageMeta(turnImages) }
+              meta: { ...this.generatedImageMeta(turnImages), ...this.generatedResultMeta() }
             };
             const next = { ...conversation, messages: [...conversation.messages, message], updatedAt: now };
             this.store.saveConversation(next);
@@ -2833,6 +3125,9 @@ export class Agent {
       id: id("msg"),
       role: "assistant",
       content: (safeFinalText || (turnImages.length > 0 ? "Here's the generated image." : "I couldn't generate a response. Please try again.")) + stoppedText,
+      // The generated images also live as durable generated results, so the
+      // explicit image-mode message carries the same normalized data as every
+      // other generated result (and one copy of the base64).
       createdAt: now,
       startedAt,
       completedAt: now,
@@ -2840,6 +3135,7 @@ export class Agent {
       provider: usedProvider,
       meta: {
         ...this.generatedImageMeta(turnImages),
+        ...this.generatedResultMeta(),
         ...(turnThinking ? { thinking: turnThinking } : {})
       }
     };

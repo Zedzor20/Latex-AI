@@ -80,10 +80,25 @@ const NOT_SUPPORTED = (reason: string, format = "none"): ExposedReasoning => ({
 /** Models that are not text chat models at all — never eligible. */
 const NON_CHAT = /embedding|embed|rerank|moderation|whisper|tts|audio|speech|transcri|imagen|veo|lyria|image|vision-ocr|dall-e|flux|stable-diffusion|nano-banana|computer-use|codex-mini|guard|safety/i;
 
-/** Gemini thought summaries: available from 2.5 onwards. */
-const GEMINI_THINKING = /^gemini-(2\.5|3|4|5|6)/i;
-/** Gemini variants we will not enable thoughts on (specialised agent/utility models). */
-const GEMINI_NO_THOUGHTS = /deep-research|antigravity|robotics|computer-use|learnlm|gemma/i;
+/**
+ * Gemini thought summaries: available from 2.5 onwards.
+ *
+ * The `-latest` / `-exp` ALIASES are included because the Gemini API serves them
+ * from the current (2.5+) family — `models/gemini-flash-latest` is exactly the
+ * id a user sees in the model list, and missing it silently turned thinking OFF
+ * for that selection (no `includeThoughts`, so no reasoning event ever arrived
+ * and the Thinking section stayed empty in Main).
+ */
+const GEMINI_THINKING_ALT = "(?:2\\.[5-9]|[3-9]|(?:pro|flash|flash-lite)(?:-latest|-exp)?)";
+const GEMINI_THINKING = new RegExp(`^gemini-${GEMINI_THINKING_ALT}`, "i");
+/**
+ * Gemini variants we will not enable thoughts on.
+ *
+ * Pre-2.5 families (1.x/2.0) have no thought summaries to request, so a `-latest`
+ * alias that still names one is excluded here rather than relying on the alias
+ * regex alone.
+ */
+const GEMINI_NO_THOUGHTS = /deep-research|antigravity|robotics|computer-use|learnlm|gemma|^gemini-1|^gemini-2\.0/i;
 
 /** OpenAI reasoning families, only where the ENDPOINT exposes the reasoning text. */
 const OPENAI_REASONING = /(?:^|\/)(o1|o3|o4|o4-mini|gpt-5|gpt-5\.\d|gpt-oss)(?:[-/:.]|$)/i;
@@ -115,10 +130,13 @@ const OPEN_REASONING = new RegExp(
 );
 
 /**
- * Gemini models proxied by another provider ("google/gemini-3.5-flash") still
- * expose reasoning, so the family match is allowed after a namespace slash.
+ * Gemini models proxied by another provider ("google/gemini-3.5-flash",
+ * "google/gemini-flash-latest") still expose reasoning, so the family match is
+ * allowed after a namespace slash. This is what makes Thinking work for an
+ * OmniRoute selection based on the UNDERLYING model rather than on OmniRoute
+ * being selected.
  */
-const PROXIED_GEMINI = /(?:^|\/)gemini-(?:2\.5|3|4|5|6)/i;
+const PROXIED_GEMINI = new RegExp(`(?:^|/)gemini-${GEMINI_THINKING_ALT}`, "i");
 /**
  * Names that mean the variant does NOT expose thinking by default: explicit
  * non-thinking flags and plain `instruct` builds whose reasoning is off unless

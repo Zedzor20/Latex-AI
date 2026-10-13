@@ -110,6 +110,55 @@ export interface GeneratedImage {
   mimeType: string;
 }
 
+/**
+ * One normalized, PERSISTED result the agent produced during a turn.
+ *
+ * A meaningful result is not only a file change: a generated image, a graph,
+ * a chart or a tool-produced artifact is an assistant RESULT too, and it must
+ * survive the temporary task/activity UI (Thinking collapse, final response,
+ * tab/chat switch, restart). This is the normalized representation that a
+ * recreated renderer can rebuild from — never a React instance, never a DOM
+ * node, never raw tool JSON.
+ */
+export type GeneratedResultKind = "image" | "graph" | "chart" | "artifact" | "visual";
+
+export interface GeneratedResult {
+  /**
+   * Stable identity. Deduplication key: the same result arriving twice (a
+   * repeated stream event, an IPC reconnect, a restored task, a rerender) must
+   * stay ONE persisted result. Derived from the tool call (or the image index)
+   * rather than from renderer state, so it is identical across reloads.
+   */
+  resultId: string;
+  kind: GeneratedResultKind;
+  status: "completed" | "failed";
+  createdAt: number;
+  /** Persistent task this result belongs to. */
+  taskId?: string;
+  /** Tool call that produced it (the stable toolCallId from execution). */
+  toolCallId?: string;
+  /** Assistant message this result belongs to. */
+  messageId?: string;
+  /** Tool that produced it, when applicable. */
+  tool?: string;
+  /** Short human label (never raw tool JSON). */
+  title?: string;
+  /** Base64 image payload for image-kind results (no data: prefix). */
+  base64?: string;
+  mimeType?: string;
+  /**
+   * Normalized structured data (bounded) for graph/chart/artifact results —
+   * the values a renderer needs, NEVER the tool's raw response.
+   */
+  data?: Record<string, unknown>;
+}
+
+/**
+ * The real outcome state of a task, derived from the WHOLE verified result.
+ * "no filesystem change" is deliberately not a synonym for "nothing happened".
+ */
+export type TaskResultState = "NO_RESULT" | "SUCCESS" | "PARTIAL_SUCCESS" | "FAILED" | "CANCELLED";
+
 export interface GeminiModel {
   name: string;
   displayName?: string;
@@ -291,8 +340,16 @@ export interface FileOperationResult {
   success: boolean;
   operation: string;
   path?: string;
+  /**
+   * The ABSOLUTE destination the operation really resolved to (workspace root
+   * joined with the relative path). Recorded so the task result and the
+   * activity timeline can name the exact path that was touched — never "`.`".
+   */
+  resolvedPath?: string;
   verified?: boolean;
   error?: string;
+  /** True when the folder already existed (a confirmation, not a new change). */
+  alreadyExisted?: boolean;
 }
 
 /** An operation the agent wants to perform that requires user approval. */
@@ -381,6 +438,12 @@ export interface AgentEvent {
      * Preview buffer only — never the committed filesystem content.
      */
     | "file_operation"
+    /**
+     * A completed, normalized generated result (image / graph / chart /
+     * artifact). Its own channel: it never rides the assistant text stream and
+     * never the activity timeline, and it is persisted on the owning message.
+     */
+    | "generated_result"
     /**
      * High-level ACTIVITY status line: { text, at }.
      *
@@ -554,6 +617,12 @@ export interface TaskOperation {
   to?: string;
   status: "success" | "failed" | "rejected";
   verified?: boolean;
+  /** Absolute path the operation resolved to (undefined when it never ran). */
+  resolvedPath?: string;
+  /** Actionable reason a failed/rejected operation did not complete. */
+  error?: string;
+  /** True when a folder/file already existed — a confirmation, not a change. */
+  alreadyExisted?: boolean;
   command?: string;
   exitCode?: number | null;
   at: number;
